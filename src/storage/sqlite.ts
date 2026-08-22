@@ -319,13 +319,14 @@ export class SqliteStorage implements StorageBackend {
       const pausedQueues = new Set(JSON.parse(this.metaGet("pausedQueues") ?? "[]") as string[]);
       const rateRules = JSON.parse(this.metaGet("rateRules") ?? "[]") as RateLimitRule[];
       const concLimits = JSON.parse(this.metaGet("concLimits") ?? "[]") as ConcurrencyLimit[];
-      const wanted = req.queues.map((q) => "?").join(",");
+      const queueFilter = req.queues.length > 0;
+      const wanted = req.queues.map(() => "?").join(",");
       const candidates = this.db
         .prepare(
-          `SELECT ${JOB_COLUMNS} FROM qw_jobs WHERE state='queued' AND run_at<=? AND queue IN (${wanted})
+          `SELECT ${JOB_COLUMNS} FROM qw_jobs WHERE state='queued' AND run_at<=? ${queueFilter ? `AND queue IN (${wanted})` : ""}
            ORDER BY priority DESC, run_at ASC, seq ASC LIMIT ?`,
         )
-        .all(t, ...req.queues, req.limit * 20 + 50) as unknown as JobRow[];
+        .all(...(queueFilter ? [t, ...req.queues] : [t]), req.limit * 20 + 50) as unknown as JobRow[];
       const buckets = new Map<string, BucketState>();
       for (const row of this.db.prepare(`SELECT key, window_start, tokens FROM qw_rate_buckets`).all() as Array<{ key: string; window_start: number; tokens: number }>) {
         buckets.set(row.key, { windowStart: row.window_start, tokens: row.tokens });
@@ -566,6 +567,20 @@ export class SqliteStorage implements StorageBackend {
         .prepare(`UPDATE qw_jobs SET payload=?, payload_version=?, updated_at=?, events_json=? WHERE id=?`)
         .run(input.payload, input.payloadVersion, t, JSON.stringify(job.events), input.jobId);
       return this.getJobInTx(input.jobId)!;
+    });
+  }
+
+  async setProgress(jobId: string, fraction: number, note: string | null): Promise<void> {
+    this.assertOpen();
+    this.tx(() => {
+      const t = this.now();
+      const job = this.getJobInTx(jobId);
+      if (!job || job.state !== "running") return;
+      job.progress = { fraction, note, at: t };
+      pushEvent(job, "progress", `${Math.round(fraction * 100)}%${note ? ` ${note}` : ""}`, t);
+      this.db
+        .prepare(`UPDATE qw_jobs SET progress_json=?, updated_at=?, events_json=? WHERE id=? AND state='running'`)
+        .run(JSON.stringify(job.progress), t, JSON.stringify(job.events), jobId);
     });
   }
 

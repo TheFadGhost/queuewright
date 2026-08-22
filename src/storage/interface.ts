@@ -12,6 +12,20 @@ import type {
   SystemStats,
 } from "../types.js";
 
+export type {
+  AttemptRecord,
+  ClaimRequest,
+  CompletionSample,
+  EnqueueInput,
+  FailAttemptInput,
+  IdempotencyOutcome,
+  JobRecord,
+  JobsPage,
+  ListJobsQuery,
+  ScheduleRecord,
+  SystemStats,
+};
+
 export interface StorageOptions {
   now?: () => number;
 }
@@ -119,6 +133,8 @@ export interface StorageBackend {
   cancelJob(jobId: string): Promise<JobRecord>;
   requeueJob(jobId: string, opts: RequeueOptions): Promise<JobRecord>;
   updatePayload(input: UpdatePayloadInput): Promise<JobRecord>;
+  /** Persist handler progress while running; ignored when the job left running state. */
+  setProgress(jobId: string, fraction: number, note: string | null): Promise<void>;
 
   purgeRetention(olderThanMs: number): Promise<number>;
 

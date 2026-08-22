@@ -197,8 +197,9 @@ export class MemoryStorage implements StorageBackend {
       }
     }
     const wanted = new Set(req.queues);
+    const queueFilter = wanted.size === 0 ? null : wanted;
     const candidates = [...this.store.jobs.values()]
-      .filter((j) => j.state === "queued" && j.runAt <= t && wanted.has(j.queue))
+      .filter((j) => j.state === "queued" && j.runAt <= t && (queueFilter === null || queueFilter.has(j.queue)))
       .sort(
         (a, b) =>
           b.priority - a.priority || a.runAt - b.runAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
@@ -423,6 +424,16 @@ export class MemoryStorage implements StorageBackend {
     job.updatedAt = t;
     pushEvent(job, "payload_updated", null, t);
     return structuredCloneJob(job);
+  }
+
+  async setProgress(jobId: string, fraction: number, note: string | null): Promise<void> {
+    this.assertOpen();
+    const job = this.store.jobs.get(jobId);
+    if (!job || job.state !== "running") return;
+    const t = this.now();
+    job.progress = { fraction, note, at: t };
+    job.updatedAt = t;
+    pushEvent(job, "progress", `${Math.round(fraction * 100)}%${note ? ` ${note}` : ""}`, t);
   }
 
   async purgeRetention(olderThanMs: number): Promise<number> {
