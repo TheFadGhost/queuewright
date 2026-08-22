@@ -1,0 +1,37 @@
+{
+  "name": "queuewright",
+  "version": "0.1.0",
+  "description": "A background job queue and scheduler with retries, a worker runtime, and a monitoring dashboard.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "bin": {
+    "qw": "./dist/cli.js",
+    "qw-worker": "./dist/worker-main.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "dashboard-assets"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/copy-assets.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "tsx"
+  },
+  "keywords": [
+    "queue",
+    "jobs",
+    "background",
+    "scheduler",
+    "cron",
+    "retries",
+    "worker",
+    "dead-letter"
+  ]
+}
