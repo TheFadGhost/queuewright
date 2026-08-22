@@ -153,5 +153,7 @@ class ChildLogger {
 }
 
 function merge(a: LogFields, b: LogFields): LogFields {
-  return { ...a, ...b, kv: { ...a.kv, ...b.kv }, err: b.err ?? a.err };
+  const merged: LogFields = { ...a, ...b, kv: { ...a.kv, ...b.kv } };
+  if (b.err !== undefined) merged.err = b.err;
+  return merged;
 }

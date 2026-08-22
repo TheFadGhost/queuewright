@@ -10,19 +10,29 @@ import type {
   JobsPage,
   LifecycleEvent,
   ListJobsQuery,
-  PauseControl,
   ScheduleRecord,
-  ScheduleUpsertInput,
   SystemStats,
 } from "../types.js";
 import { MAX_ATTEMPTS_HISTORY, MAX_EVENTS_PER_JOB } from "../types.js";
 import { assertTransition } from "../state-machine.js";
 import { DuplicateJobError, JobNotFoundError, LeaseLostError, StorageUnavailableError } from "../errors.js";
 import type {
+  ConcurrencyLimit,
+  PauseControl,
+  RateLimitRule,
   RequeueOptions as RequeueOpts,
+  ScheduleUpsertInput,
   StorageBackend,
   UpdatePayloadInput,
 } from "./interface.js";
+import {
+  type BucketState,
+  concurrencyAllows,
+  newAttemptRecord,
+  pushEvent,
+  rulesForJob,
+  takeBucket,
+} from "./shared.js";
 
 export interface MemoryStorageOptions {
   now?: () => number;
@@ -57,6 +67,9 @@ export class MemoryStorage implements StorageBackend {
   private store: Store = emptyStore();
   private now: () => number;
   private closed = false;
+  private rateRules: RateLimitRule[] = [];
+  private concLimits: ConcurrencyLimit[] = [];
+  private buckets = new Map<string, BucketState>();
 
   constructor(opts: MemoryStorageOptions = {}) {
     this.now = opts.now ?? Date.now;
@@ -72,11 +85,6 @@ export class MemoryStorage implements StorageBackend {
 
   private assertOpen(): void {
     if (this.closed) throw new StorageUnavailableError(new Error("storage closed"));
-  }
-
-  private pushEvent(job: JobRecord, event: LifecycleEvent["event"], detail: string | null): void {
-    job.events.push({ ts: this.now(), event, detail });
-    if (job.events.length > MAX_EVENTS_PER_JOB) job.events.splice(0, job.events.length - MAX_EVENTS_PER_JOB);
   }
 
   async enqueue(input: EnqueueInput): Promise<JobRecord> {
@@ -114,7 +122,7 @@ export class MemoryStorage implements StorageBackend {
       events: [],
       attemptsHistory: [],
     };
-    this.pushEvent(job, "enqueued", state === "scheduled" ? `runAt=${new Date(t).toISOString()}` : null);
+    pushEvent(job, "enqueued", state === "scheduled" ? `runAt=${new Date(t).toISOString()}` : null, t);
     this.store.jobs.set(id, job);
     if (input.dedupeKey !== null) this.store.dedupe.set(input.dedupeKey, id);
     return structuredCloneJob(job);
@@ -195,30 +203,40 @@ export class MemoryStorage implements StorageBackend {
         (a, b) =>
           b.priority - a.priority || a.runAt - b.runAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
       );
+    const runningByQueue = new Map<string, number>();
+    const runningByType = new Map<string, number>();
+    for (const j of this.store.jobs.values()) {
+      if (j.state === "running") {
+        runningByQueue.set(j.queue, (runningByQueue.get(j.queue) ?? 0) + 1);
+        runningByType.set(j.type, (runningByType.get(j.type) ?? 0) + 1);
+      }
+    }
     const claimed: JobRecord[] = [];
     for (const job of candidates) {
       if (claimed.length >= req.limit) break;
       if (this.store.pausedQueues.has(job.queue)) continue;
+      if (
+        !concurrencyAllows(this.concLimits, { runningByQueue, runningByType }, job.queue, job.type)
+      ) {
+        continue;
+      }
+      let rateOk = true;
+      for (const rule of rulesForJob(this.rateRules, job)) {
+        if (!takeBucket(this.buckets, rule.key, rule.limit, rule.windowMs, t)) {
+          rateOk = false;
+          break;
+        }
+      }
+      if (!rateOk) continue;
       job.state = "running";
       job.attempts += 1;
       job.leaseUntil = t + req.visibilityTimeoutMs;
       job.leaseOwner = req.workerId;
       job.updatedAt = t;
-      const attempt: AttemptRecord = {
-        attempt: job.attempts,
-        startedAt: t,
-        finishedAt: null,
-        durationMs: null,
-        outcome: "running",
-        errorName: null,
-        errorMessage: null,
-        stack: null,
-      };
-      job.attemptsHistory.push(attempt);
-      if (job.attemptsHistory.length > MAX_ATTEMPTS_HISTORY) {
-        job.attemptsHistory.splice(0, job.attemptsHistory.length - MAX_ATTEMPTS_HISTORY);
-      }
-      this.pushEvent(job, "claimed", `worker=${req.workerId} attempt=${job.attempts}`);
+      newAttemptRecord(job, t);
+      pushEvent(job, "claimed", `worker=${req.workerId} attempt=${job.attempts}`, t);
+      runningByQueue.set(job.queue, (runningByQueue.get(job.queue) ?? 0) + 1);
+      runningByType.set(job.type, (runningByType.get(job.type) ?? 0) + 1);
       claimed.push(structuredCloneJob(job));
     }
     return claimed;
@@ -249,7 +267,7 @@ export class MemoryStorage implements StorageBackend {
       rec.durationMs = t - rec.startedAt;
       rec.outcome = "succeeded";
     }
-    this.pushEvent(job, "completed", `attempt=${job.attempts}`);
+    pushEvent(job, "completed", `attempt=${job.attempts}`, t);
     this.store.completions.push({
       finishedAt: t,
       durationMs: rec?.durationMs ?? 0,
@@ -278,7 +296,7 @@ export class MemoryStorage implements StorageBackend {
     job.leaseUntil = null;
     job.leaseOwner = null;
     job.updatedAt = t;
-    this.pushEvent(job, "attempt_failed", `attempt=${job.attempts} err=${input.errorName}`);
+    pushEvent(job, "attempt_failed", `attempt=${job.attempts} err=${input.errorName}`, t);
     this.store.completions.push({
       finishedAt: t,
       durationMs: rec?.durationMs ?? 0,
@@ -299,11 +317,11 @@ export class MemoryStorage implements StorageBackend {
     job.state = target;
     if (target === "retrying") {
       job.runAt = input.nextRunAt ?? t;
-      this.pushEvent(job, "retry_scheduled", `nextRunAt=${new Date(job.runAt).toISOString()}`);
+      pushEvent(job, "retry_scheduled", `nextRunAt=${new Date(job.runAt).toISOString()}`, t);
     } else if (target === "dead") {
-      this.pushEvent(job, "moved_to_dead", `attempts=${job.attempts}/${job.maxAttempts}`);
+      pushEvent(job, "moved_to_dead", `attempts=${job.attempts}/${job.maxAttempts}`, t);
     } else {
-      this.pushEvent(job, "moved_to_failed", `err=${input.errorName}`);
+      pushEvent(job, "moved_to_failed", `err=${input.errorName}`, t);
     }
     return target;
   }
@@ -329,7 +347,7 @@ export class MemoryStorage implements StorageBackend {
         job.leaseUntil = null;
         job.leaseOwner = null;
         job.updatedAt = t;
-        this.pushEvent(job, "reclaimed", `attempt=${job.attempts}`);
+        pushEvent(job, "reclaimed", `attempt=${job.attempts}`, t);
         n++;
       }
     }
@@ -349,7 +367,7 @@ export class MemoryStorage implements StorageBackend {
         job.leaseUntil = null;
         job.leaseOwner = null;
         job.updatedAt = t;
-        this.pushEvent(job, "lease_released", `worker=${workerId}`);
+        pushEvent(job, "lease_released", `worker=${workerId}`, t);
         n++;
       }
     }
@@ -358,14 +376,15 @@ export class MemoryStorage implements StorageBackend {
 
   async cancelJob(jobId: string): Promise<JobRecord> {
     this.assertOpen();
+    const t = this.now();
     const job = this.store.jobs.get(jobId);
     if (!job) throw new JobNotFoundError(jobId);
     assertTransition(jobId, job.state, "cancelled");
     job.state = "cancelled";
     job.leaseUntil = null;
     job.leaseOwner = null;
-    job.updatedAt = this.now();
-    this.pushEvent(job, "cancelled", null);
+    job.updatedAt = t;
+    pushEvent(job, "cancelled", null, t);
     this.releaseDedupe(job);
     return structuredCloneJob(job);
   }
@@ -380,7 +399,7 @@ export class MemoryStorage implements StorageBackend {
     if (opts.payload) {
       job.payload = opts.payload.payload;
       job.payloadVersion = opts.payload.payloadVersion;
-      this.pushEvent(job, "payload_updated", null);
+      pushEvent(job, "payload_updated", null, t);
     }
     if (opts.priority !== null && opts.priority !== undefined) job.priority = opts.priority;
     job.state = "queued";
@@ -389,19 +408,20 @@ export class MemoryStorage implements StorageBackend {
     job.leaseOwner = null;
     job.result = null;
     job.updatedAt = t;
-    this.pushEvent(job, "requeued", opts.resetAttempts ? "attempts reset" : null);
+    pushEvent(job, "requeued", opts.resetAttempts ? "attempts reset" : null, t);
     if (job.dedupeKey !== null) this.store.dedupe.set(job.dedupeKey, job.id);
     return structuredCloneJob(job);
   }
 
   async updatePayload(input: UpdatePayloadInput): Promise<JobRecord> {
     this.assertOpen();
+    const t = this.now();
     const job = this.store.jobs.get(input.jobId);
     if (!job) throw new JobNotFoundError(input.jobId);
     job.payload = input.payload;
     job.payloadVersion = input.payloadVersion;
-    job.updatedAt = this.now();
-    this.pushEvent(job, "payload_updated", null);
+    job.updatedAt = t;
+    pushEvent(job, "payload_updated", null, t);
     return structuredCloneJob(job);
   }
 
@@ -425,7 +445,7 @@ export class MemoryStorage implements StorageBackend {
       queued: 0, scheduled: 0, running: 0, succeeded: 0, failed: 0, retrying: 0, dead: 0, cancelled: 0,
     };
     const queues = new Map<string, SystemStats["queues"][number]>();
-    const types = new Map<string, { total: number; dead: number; failed: number }>();
+    const types = new Map<string, { type: string; total: number; dead: number; failed: number }>();
     let oldestQueuedAt: number | null = null;
     for (const job of this.store.jobs.values()) {
       states[job.state]++;
@@ -462,9 +482,25 @@ export class MemoryStorage implements StorageBackend {
     return this.store.completions.filter((c) => c.finishedAt >= fromMs && c.finishedAt <= toMs);
   }
 
-  async takeRateToken(_key: string, _limit: number, _windowMs: number): Promise<boolean> {
+  async takeRateToken(key: string, limit: number, windowMs: number): Promise<boolean> {
     this.assertOpen();
-    return true;
+    return takeBucket(this.buckets, key, limit, windowMs, this.now());
+  }
+
+  async setRateRules(rules: RateLimitRule[]): Promise<void> {
+    this.rateRules = [...rules];
+  }
+
+  async getRateRules(): Promise<RateLimitRule[]> {
+    return [...this.rateRules];
+  }
+
+  async setConcurrencyLimits(limits: ConcurrencyLimit[]): Promise<void> {
+    this.concLimits = [...limits];
+  }
+
+  async getConcurrencyLimits(): Promise<ConcurrencyLimit[]> {
+    return [...this.concLimits];
   }
 
   async beginIdempotency(key: string): Promise<IdempotencyOutcome<string>> {
@@ -554,7 +590,7 @@ export class MemoryStorage implements StorageBackend {
         onSuccess: null,
       });
       job.scheduleId = scheduleId;
-      this.pushEvent(job, "schedule_fired", `schedule=${scheduleId}`);
+      pushEvent(job, "schedule_fired", `schedule=${scheduleId}`, t);
       created.push(job);
     }
     sched.lastFiredAt = fireTimes.length > 0 ? fireTimes[fireTimes.length - 1]! : t;

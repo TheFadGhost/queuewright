@@ -12,18 +12,6 @@ import type {
   SystemStats,
 } from "../types.js";
 
-export interface RateLimitRule {
-  /** "queue:email" or "type:mail.welcome" */
-  key: string;
-  limit: number;
-  windowMs: number;
-}
-
-export interface ConcurrencyLimit {
-  key: string;
-  max: number;
-}
-
 export interface StorageOptions {
   now?: () => number;
 }
@@ -59,6 +47,22 @@ export interface PauseControl {
   scope: "global" | "queue";
   queue: string | null;
   paused: boolean;
+}
+
+/**
+ * Token-bucket rule applied during claims. Key is either "queue:<name>" or
+ * "type:<jobType>"; the bucket allows at most `limit` claims per `windowMs`.
+ */
+export interface RateLimitRule {
+  key: string;
+  limit: number;
+  windowMs: number;
+}
+
+/** Cap on concurrently running jobs per "queue:<name>" or "type:<jobType>" key. */
+export interface ConcurrencyLimit {
+  key: string;
+  max: number;
 }
 
 /**
@@ -142,6 +146,12 @@ export interface StorageBackend {
   ): Promise<JobRecord[]>;
 
   setPaused(control: PauseControl): Promise<void>;
+
+  setRateRules(rules: RateLimitRule[]): Promise<void>;
+  getRateRules(): Promise<RateLimitRule[]>;
+  setConcurrencyLimits(limits: ConcurrencyLimit[]): Promise<void>;
+  getConcurrencyLimits(): Promise<ConcurrencyLimit[]>;
+  takeRateToken(key: string, limit: number, windowMs: number): Promise<boolean>;
 
   /** Raw access used by the dashboard/API to render one full record. */
   getJobEvents(jobId: string): Promise<Array<{ ts: number; event: string; detail: string | null }>>;
