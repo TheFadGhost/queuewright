@@ -793,7 +793,7 @@ export class SqliteStorage implements StorageBackend {
       }
       this.db
         .prepare(`UPDATE qw_schedules SET last_fired_at=?, next_fire_at=? WHERE id=?`)
-        .run(fireTimes.length > 0 ? fireTimes[fireTimes.length - 1]! : t, nextFireAt, scheduleId);
+        .run(fireTimes.length > 0 ? fireTimes[fireTimes.length - 1]! : sched.lastFiredAt, nextFireAt, scheduleId);
       return created;
     });
   }

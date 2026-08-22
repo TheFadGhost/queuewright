@@ -604,7 +604,9 @@ export class MemoryStorage implements StorageBackend {
       pushEvent(job, "schedule_fired", `schedule=${scheduleId}`, t);
       created.push(job);
     }
-    sched.lastFiredAt = fireTimes.length > 0 ? fireTimes[fireTimes.length - 1]! : t;
+    if (fireTimes.length > 0) {
+      sched.lastFiredAt = fireTimes[fireTimes.length - 1]!;
+    }
     sched.nextFireAt = nextFireAt;
     return created;
   }

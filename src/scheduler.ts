@@ -46,7 +46,6 @@ export class Scheduler {
     const now = this.qw.clock();
     const schedules = await this.qw.listSchedules();
     for (const sched of schedules) {
-      if (!this.running) return;
       await this.processSchedule(sched, now);
     }
   }
@@ -110,16 +109,16 @@ export class Scheduler {
 function collectMissed(
   parsed: ParsedCron,
   tz: string,
-  lastFiredAt: number | null,
+  _lastFiredAt: number | null,
   firstDue: number,
   now: number,
 ): { all: number[]; next: number } {
   const all: number[] = [];
-  let cursor = lastFiredAt === null ? firstDue : firstDue;
+  let cursor = firstDue;
   let guard = 0;
   while (cursor <= now && guard < MAX_CATCH_UP_SLOTS * 2) {
     all.push(cursor);
-    const next = nextFireAfter(parsed, tz, cursor - 1);
+    const next = nextFireAfter(parsed, tz, cursor);
     if (next === null) break;
     cursor = next;
     guard++;
