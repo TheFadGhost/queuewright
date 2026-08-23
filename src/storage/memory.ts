@@ -15,7 +15,7 @@ import type {
 } from "../types.js";
 import { MAX_ATTEMPTS_HISTORY, MAX_EVENTS_PER_JOB } from "../types.js";
 import { assertTransition } from "../state-machine.js";
-import { DuplicateJobError, JobNotFoundError, LeaseLostError, StorageUnavailableError } from "../errors.js";
+import { DuplicateJobError, DuplicateScheduleError, IdempotencyKeyBusyError, JobNotFoundError, ScheduleNotFoundError, LeaseLostError, StorageUnavailableError } from "../errors.js";
 import type {
   ConcurrencyLimit,
   PauseControl,
@@ -28,6 +28,9 @@ import type {
 import {
   type BucketState,
   concurrencyAllows,
+  decideFailTarget,
+  decodeCursor,
+  encodeCursor,
   newAttemptRecord,
   pushEvent,
   rulesForJob,
@@ -94,6 +97,9 @@ export class MemoryStorage implements StorageBackend {
     if (input.dedupeKey !== null && this.store.dedupe.has(input.dedupeKey)) {
       throw new DuplicateJobError(input.dedupeKey, this.store.dedupe.get(input.dedupeKey)!, id);
     }
+    if (input.id !== undefined && this.store.jobs.has(input.id)) {
+      throw new DuplicateJobError(input.id, input.id, input.id);
+    }
     const state: JobState = input.runAt <= t ? "queued" : "scheduled";
     const job: JobRecord = {
       id,
@@ -122,20 +128,28 @@ export class MemoryStorage implements StorageBackend {
       events: [],
       attemptsHistory: [],
     };
-    pushEvent(job, "enqueued", state === "scheduled" ? `runAt=${new Date(t).toISOString()}` : null, t);
+    pushEvent(job, "enqueued", state === "scheduled" ? `runAt=${new Date(input.runAt).toISOString()}` : null, t);
     this.store.jobs.set(id, job);
     if (input.dedupeKey !== null) this.store.dedupe.set(input.dedupeKey, id);
     return structuredCloneJob(job);
   }
 
   async enqueueBatch(inputs: EnqueueInput[]): Promise<JobRecord[]> {
+    const seenIds = new Set<string>();
+    const seenKeys = new Set<string>();
     for (const input of inputs) {
-      if (input.dedupeKey !== null && this.store.dedupe.has(input.dedupeKey)) {
-        throw new DuplicateJobError(
-          input.dedupeKey,
-          this.store.dedupe.get(input.dedupeKey)!,
-          input.id ?? "batch-item",
-        );
+      if (input.id !== undefined) {
+        if (seenIds.has(input.id) || this.store.jobs.has(input.id)) {
+          throw new DuplicateJobError(input.id, input.id, "batch item");
+        }
+        seenIds.add(input.id);
+      }
+      if (input.dedupeKey !== null) {
+        const existing = this.store.dedupe.get(input.dedupeKey);
+        if (existing !== undefined || seenKeys.has(input.dedupeKey)) {
+          throw new DuplicateJobError(input.dedupeKey, existing ?? "batch", input.id ?? "batch item");
+        }
+        seenKeys.add(input.dedupeKey);
       }
     }
     const created: JobRecord[] = [];
@@ -171,13 +185,20 @@ export class MemoryStorage implements StorageBackend {
     );
     let start = 0;
     if (query.cursor) {
-      const idx = jobs.findIndex((j) => j.id === query.cursor);
-      start = idx === -1 ? 0 : idx + 1;
+      const cur = decodeCursor(query.cursor);
+      if (cur) {
+        const after = (j: JobRecord): boolean =>
+          query.order === "created_asc"
+            ? j.createdAt > cur.createdAt || (j.createdAt === cur.createdAt && j.id > cur.id)
+            : j.createdAt < cur.createdAt || (j.createdAt === cur.createdAt && j.id < cur.id);
+        start = jobs.findIndex(after);
+        if (start === -1) start = jobs.length;
+      }
     }
     const page = jobs.slice(start, start + query.limit);
     const nextCursor =
       page.length === query.limit && start + query.limit < jobs.length
-        ? page[page.length - 1]!.id
+        ? encodeCursor(page[page.length - 1]!.createdAt, page[page.length - 1]!.id)
         : null;
     return { jobs: page.map(structuredCloneJob), cursor: nextCursor };
   }
@@ -305,15 +326,7 @@ export class MemoryStorage implements StorageBackend {
       queue: job.queue,
       type: job.type,
     });
-    const exhausted = job.attempts >= job.maxAttempts;
-    let target: "retrying" | "dead" | "failed";
-    if (input.fatal) {
-      target = "failed";
-    } else if (exhausted) {
-      target = "dead";
-    } else {
-      target = "retrying";
-    }
+    const target = decideFailTarget(job, input.fatal);
     assertTransition(job.id, job.state, target);
     job.state = target;
     if (target === "retrying") {
@@ -321,16 +334,18 @@ export class MemoryStorage implements StorageBackend {
       pushEvent(job, "retry_scheduled", `nextRunAt=${new Date(job.runAt).toISOString()}`, t);
     } else if (target === "dead") {
       pushEvent(job, "moved_to_dead", `attempts=${job.attempts}/${job.maxAttempts}`, t);
-    } else {
+} else {
       pushEvent(job, "moved_to_failed", `err=${input.errorName}`, t);
     }
+    if (target !== "retrying") this.releaseDedupe(job);
     return target;
   }
 
-  async heartbeat(jobId: string, workerId: string, untilMs: number): Promise<void> {
+  async heartbeat(jobId: string, workerId: string, untilMs: number, windowMs: number): Promise<void> {
     this.assertOpen();
     const job = this.requireLease(jobId, workerId);
-    if (untilMs > (job.leaseUntil ?? 0)) job.leaseUntil = untilMs;
+    const capped = Math.min(untilMs, this.now() + windowMs);
+    if (capped > (job.leaseUntil ?? 0)) job.leaseUntil = capped;
     job.updatedAt = this.now();
   }
 
@@ -447,6 +462,18 @@ export class MemoryStorage implements StorageBackend {
       }
     }
     this.store.completions = this.store.completions.filter((c) => c.finishedAt >= olderThanMs);
+    for (const key of [...this.store.idempotency.keys()]) {
+      if (this.store.idempotency.get(key)?.status === "pending") {
+        this.store.idempotency.delete(key);
+      }
+    }
+    for (const key of [...this.store.dedupe.keys()]) {
+      const ownerId = this.store.dedupe.get(key)!;
+      const owner = this.store.jobs.get(ownerId);
+      if (!owner || !["queued", "scheduled", "running", "retrying"].includes(owner.state)) {
+        this.store.dedupe.delete(key);
+      }
+    }
     return n;
   }
 
@@ -518,6 +545,7 @@ export class MemoryStorage implements StorageBackend {
     this.assertOpen();
     const existing = this.store.idempotency.get(key);
     if (existing?.status === "done") return { status: "done", result: existing.result! };
+    if (existing?.status === "pending") return { status: "busy" };
     this.store.idempotency.set(key, { status: "pending", result: null });
     return { status: "run" };
   }
@@ -543,7 +571,7 @@ export class MemoryStorage implements StorageBackend {
   async createSchedule(input: ScheduleUpsertInput): Promise<ScheduleRecord> {
     this.assertOpen();
     if (this.store.schedules.has(input.id)) {
-      throw new Error(`schedule "${input.id}" already exists`);
+      throw new DuplicateScheduleError(input.id);
     }
     const rec: ScheduleRecord = {
       ...input,
@@ -558,7 +586,7 @@ export class MemoryStorage implements StorageBackend {
   async updateSchedule(id: string, patch: Partial<ScheduleUpsertInput>): Promise<ScheduleRecord> {
     this.assertOpen();
     const rec = this.store.schedules.get(id);
-    if (!rec) throw new JobNotFoundError(id);
+    if (!rec) throw new ScheduleNotFoundError(id);
     Object.assign(rec, patch);
     return { ...rec };
   }
@@ -579,10 +607,16 @@ export class MemoryStorage implements StorageBackend {
     return s ? { ...s } : null;
   }
 
-  async recordScheduleFires(scheduleId: string, fireTimes: number[], nextFireAt: number): Promise<JobRecord[]> {
+  async recordScheduleFires(
+    scheduleId: string,
+    fireTimes: number[],
+    nextFireAt: number,
+    expectedPrevFireAt: number | null,
+  ): Promise<JobRecord[]> {
     this.assertOpen();
     const sched = this.store.schedules.get(scheduleId);
-    if (!sched) throw new JobNotFoundError(scheduleId);
+    if (!sched) throw new ScheduleNotFoundError(scheduleId);
+    if (sched.nextFireAt !== expectedPrevFireAt) return [];
     const t = this.now();
     const created: JobRecord[] = [];
     for (const fireAt of fireTimes) {

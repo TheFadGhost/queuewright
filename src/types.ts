@@ -214,11 +214,8 @@ export interface TypeBreakdownEntry {
 
 export type IdempotencyOutcome<T> =
   | { status: "run" }
+  | { status: "busy" }
   | { status: "done"; result: T };
 
 export const MAX_EVENTS_PER_JOB = 100;
 export const MAX_ATTEMPTS_HISTORY = 100;
-
-export function cloneJobRecord(job: JobRecord): JobRecord {
-  return JSON.parse(JSON.stringify(job)) as JobRecord;
-}

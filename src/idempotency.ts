@@ -1,13 +1,14 @@
 import type { StorageBackend } from "./storage/interface.js";
-import { WrappedThrowError } from "./errors.js";
+import { IdempotencyKeyBusyError, WrappedThrowError } from "./errors.js";
 
 /**
  * Runs `fn` at most once per `key` for the lifetime of the store. The result
  * (or the error) is recorded, so a retried job that re-enters with the same
  * key receives the cached outcome instead of repeating side effects.
  *
- * This makes storage-backed effects idempotent; it cannot cover external
- * side effects that are not themselves guarded by a key.
+ * If another execution currently holds the key, this throws
+ * IdempotencyKeyBusyError so the normal retry machinery re-runs the attempt
+ * later instead of duplicating the side effect.
  */
 export async function runIdempotent<T>(
   storage: StorageBackend,
@@ -15,6 +16,7 @@ export async function runIdempotent<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   const begun = await storage.beginIdempotency(key);
+  if (begun.status === "busy") throw new IdempotencyKeyBusyError(key);
   if (begun.status === "done") {
     try {
       return JSON.parse(begun.result) as T;

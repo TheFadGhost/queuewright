@@ -1,7 +1,8 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { readFile } from "node:fs/promises";
-import { join, normalize, extname } from "node:path";
+import { join, normalize, extname, relative, isAbsolute } from "node:path";
 import type { Queuewright } from "./client.js";
+import { isJobState } from "./state-machine.js";
 import type { JobState } from "./types.js";
 
 const MIME: Record<string, string> = {
@@ -36,15 +37,25 @@ export class DashboardServer {
         res.end(JSON.stringify({ error: "internal error" }));
       });
     });
-    await new Promise<void>((resolve) => server.listen(port, host, resolve));
+await new Promise<void>((resolve, reject) => {
+      const onError = (e: Error): void => reject(e);
+      server.once("error", onError);
+      server.listen(port, host, () => {
+        server.off("error", onError);
+        resolve();
+      });
+    });
     this.server = server;
     return { port, host };
   }
 
-  async stop(): Promise<void> {
+async stop(): Promise<void> {
     if (!this.server) return;
-    await new Promise<void>((resolve) => this.server!.close(() => resolve()));
+    const s = this.server;
     this.server = null;
+    s.closeIdleConnections?.();
+    await new Promise<void>((resolve) => s.close(() => resolve()));
+    s.closeAllConnections?.();
   }
 
   get address(): string | null {
@@ -54,8 +65,15 @@ export class DashboardServer {
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? "/", "http://localhost");
-    const path = decodeURIComponent(url.pathname);
+const url = new URL(req.url ?? "/", "http://localhost");
+    let path: string;
+    try {
+      path = decodeURIComponent(url.pathname);
+    } catch {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "malformed percent-encoding in URL" }));
+      return;
+    }
     if (path.startsWith("/api/")) {
       await this.handleApi(req, res, path, url.searchParams);
       return;
@@ -127,12 +145,12 @@ export class DashboardServer {
         return;
       }
       if (path === "/api/jobs" && req.method === "GET") {
-        const states = (params.get("states") ?? "")
+const states = (params.get("states") ?? "")
           .split(",")
-          .filter((s): s is JobState => s.length > 0);
+          .filter((s): s is JobState => isJobState(s));
         const query: import("./storage/interface.js").ListJobsQuery = {
           states,
-          limit: Math.min(500, Number(params.get("limit") ?? 50) || 50),
+          limit: Math.min(500, Math.max(1, Number(params.get("limit") ?? 50) || 50)),
           cursor: params.get("cursor"),
           order: (params.get("order") as "created_desc" | "created_asc" | null) ?? "created_desc",
         };
@@ -223,14 +241,17 @@ export class DashboardServer {
         "cache-control": "no-store",
       });
       res.end(body);
-    } catch {
-      const fallback = await readFile(join(this.assetsDir, "index.html")).catch(() => null);
-      if (fallback) {
-        res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-        res.end(fallback);
-        return;
+} catch {
+      const hasExtension = extname(rawPath) !== "";
+      if (!hasExtension) {
+        const fallback = await readFile(join(this.assetsDir, "index.html")).catch(() => null);
+        if (fallback) {
+          res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+          res.end(fallback);
+          return;
+        }
       }
-      res.writeHead(404).end("dashboard assets missing");
+      res.writeHead(404).end("not found");
     }
   }
 }

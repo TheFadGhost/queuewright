@@ -107,6 +107,39 @@ export class InvalidTimezoneError extends QueuewrightError {
   }
 }
 
+export class InvalidNameError extends QueuewrightError {
+  constructor(kind: string, value: string, pattern: string) {
+    super(
+      `invalid ${kind} "${value}"`,
+      `use a name matching ${pattern}; lowercase letters, digits, dashes and dots (job types) or dashes/underscores (queues and schedule ids)`,
+    );
+  }
+}
+
+export class DuplicateScheduleError extends QueuewrightError {
+  constructor(id: string) {
+    super(
+      `schedule "${id}" already exists`,
+      `delete it first ("qw schedules delete ${id}") or pick another id`,
+    );
+  }
+}
+
+export class ScheduleNotFoundError extends QueuewrightError {
+  constructor(id: string) {
+    super(`schedule "${id}" not found`, `list schedules with "qw schedules list"`);
+  }
+}
+
+export class IdempotencyKeyBusyError extends QueuewrightError {
+  constructor(key: string) {
+    super(
+      `idempotency key "${key}" is locked by another in-flight execution`,
+      `the job will retry automatically; if this persists, a crashed attempt may still hold the key until it completes or the storage row ages out`,
+    );
+  }
+}
+
 export class StorageUnavailableError extends QueuewrightError {
   constructor(cause: unknown) {
     super(

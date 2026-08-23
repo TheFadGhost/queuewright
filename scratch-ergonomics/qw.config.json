@@ -1,0 +1,6 @@
+{
+  "storage": { "kind": "sqlite", "file": "./scratch-ergonomics/data/qw.db" },
+  "concurrency": 4,
+  "pollIntervalMs": 100,
+  "_comment": "ops.md session config; points at the app.ts dataset"
+}

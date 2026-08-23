@@ -7,9 +7,12 @@ export interface ThreadExecutionSpec {
 }
 
 export class ThreadRunError extends Error {
-  constructor(message: string) {
+  readonly timedOut: boolean;
+
+  constructor(message: string, timedOut = false) {
     super(message);
     this.name = "ThreadRunError";
+    this.timedOut = timedOut;
   }
 }
 
@@ -66,7 +69,8 @@ export function runInThread(
       void w.terminate();
       reject(
         new ThreadRunError(
-          `thread-isolated handler (${spec.module}#${spec.export}) exceeded its ${timeoutMs}ms timeout and its thread was terminated`,
+          `thread-isolated handler (${spec.module}#) exceeded its ${timeoutMs}ms timeout and its thread was terminated`,
+          true,
         ),
       );
     }, timeoutMs);

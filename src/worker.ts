@@ -4,7 +4,6 @@ import { runIdempotent } from "./idempotency.js";
 import { nextRetryDelayMs, DefaultRng } from "./retry.js";
 import { findDefinition, type JobContext } from "./registry.js";
 import type { Queuewright } from "./client.js";
-import { redactPayload } from "./observability/logger.js";
 import type { JobRecord } from "./types.js";
 import { Scheduler } from "./scheduler.js";
 import { runInThread, ThreadRunError, type ThreadExecutionSpec } from "./thread-runner.js";
@@ -50,10 +49,11 @@ export class Worker {
     if (this.running) return;
     this.running = true;
     this.stopRequested = false;
-    const log = this.qw.logger.child({ module: "worker" });
+const log = this.qw.logger.child({ module: "worker" });
     log.info("worker starting", {
       kv: { workerId: this.workerId, concurrency: this.qw.concurrency },
     });
+    if (this.scheduler) this.scheduler.start();
     const sweepMs = Math.max(1000, Math.floor(this.qw.visibilityTimeoutMs / 3));
     const sweeper = setInterval(() => {
       void this.sweep();
@@ -141,13 +141,15 @@ export class Worker {
 
     heartbeat = setInterval(() => {
       void this.storage
-        .heartbeat(job.id, this.workerId, this.qw.clock() + this.qw.visibilityTimeoutMs)
+        .heartbeat(job.id, this.workerId, this.qw.clock() + this.qw.visibilityTimeoutMs, this.qw.visibilityTimeoutMs)
         .catch((e) => this.logFrameworkError("heartbeat failed", e));
     }, Math.max(250, Math.floor(this.qw.visibilityTimeoutMs / 3)));
     heartbeat.unref?.();
 
     try {
       if (!def) {
+        clearInterval(heartbeat);
+        if (timeout !== null) clearTimeout(timeout);
         await this.storage.failAttempt({
           jobId: job.id,
           workerId: this.workerId,
@@ -157,6 +159,8 @@ export class Worker {
           fatal: true,
           timedOut: false,
           nextRunAt: null,
+        }).catch((e2) => {
+          this.logFrameworkError("failed to record unregistered-type failure", e2);
         });
         jlog.error(
           `job type "${job.type}" is not registered in this process; job moved to failed`,
@@ -191,8 +195,8 @@ export class Worker {
         try {
           await runInThread(spec.thread, payload, timeoutMs);
         } catch (e) {
-          timedOut = e instanceof ThreadRunError && e.message.includes("exceeded its");
-          await this.handleFailure(e, job, timedOut, jlog, timeoutMs);
+          timedOut = e instanceof ThreadRunError && e.timedOut;
+          await this.handleFailure(e, job, timedOut, jlog, timeoutMs, startedAt);
           return;
         }
         await this.storage.completeJob(job.id, this.workerId, null).catch((e2) => {
@@ -242,20 +246,33 @@ export class Worker {
         .catch(async (e) => ({ ok: false as const, e }));
       if (outcome.ok) {
         resultJson = outcome.r === undefined ? null : safeJson(outcome.r);
-        await this.storage.completeJob(job.id, this.workerId, resultJson);
+        try {
+          await this.storage.completeJob(job.id, this.workerId, resultJson);
+        } catch (e2) {
+          if (e2 instanceof LeaseLostError) {
+            jlog.warn("lost the lease; another worker owns this job now", {
+              err: errFields(e2),
+            });
+            return;
+          }
+          // Framework error, not a handler failure: leave the lease in place
+          // so the sweeper reclaims and the job re-runs (at-least-once).
+          throw e2;
+        }
         this.qw.metrics.inc("qw_jobs_completed_total", [
           ["queue", job.queue],
           ["type", job.type],
           ["result", "succeeded"],
         ]);
-        this.qw.metrics.observeDuration(job.queue, job.type, this.qw.clock() - startedAt);
-        jlog.info("job completed", { attempt: job.attempts, durationMs: this.qw.clock() - startedAt });
+        const elapsed = this.qw.clock() - startedAt;
+        this.qw.metrics.observeDuration(job.queue, job.type, elapsed);
+        jlog.info("job completed", { attempt: job.attempts, durationMs: elapsed });
         await this.chainSuccess(def.type, outcome.r, payload);
         return;
       }
       clearTimeout(timeout!);
       clearInterval(heartbeat);
-      await this.handleFailure(outcome.e, job, timedOut, jlog, timeoutMs);
+      await this.handleFailure(outcome.e, job, timedOut, jlog, timeoutMs, startedAt);
     } catch (e) {
       clearTimeout(timeout!);
       clearInterval(heartbeat);
@@ -265,7 +282,7 @@ export class Worker {
         });
         return;
       }
-      await this.handleFailure(e, job, timedOut, jlog, timeoutMs);
+      await this.handleFailure(e, job, timedOut, jlog, timeoutMs, startedAt);
     }
   }
 
@@ -275,6 +292,7 @@ export class Worker {
     timedOut: boolean,
     jlog: ReturnType<Queuewright["logger"]["child"]>,
     timeoutMs: number,
+    startedAtRef: number,
   ): Promise<void> {
     const fatal = e instanceof FatalJobError;
     const wrapped = !(e instanceof Error) ? new WrappedThrowError(e) : e;
@@ -317,15 +335,11 @@ export class Worker {
           ["result", "failed"],
         ]);
       }
-      this.qw.metrics.observeDuration(job.queue, job.type, this.qw.clock());
+      this.qw.metrics.observeDuration(job.queue, job.type, Math.max(0, this.qw.clock() - startedAtRef));
       jlog.warn(`job attempt failed (${target})`, {
         attempt: job.attempts,
         err: { name, message, stack },
       });
-      if (process.env["QW_LOG_UNSAFE_PAYLOADS"] === "1" && !this.warnedUnsafe) {
-        this.warnedUnsafe = true;
-        this.qw.logger.noteUnsafePayloads();
-      }
     } catch (e2) {
       if (e2 instanceof LeaseLostError) {
         jlog.warn("lost the lease while recording failure; job owned elsewhere", {
@@ -336,8 +350,6 @@ export class Worker {
       this.logFrameworkError("failed to record job failure; job stays leased until reclaim", e2);
     }
   }
-
-  private warnedUnsafe = false;
 
   private async chainSuccess(type: string, result: unknown, sourcePayload: unknown): Promise<void> {
     const def = findDefinition(type);
@@ -377,6 +389,7 @@ export class Worker {
   async stop(): Promise<void> {
     if (!this.running) return;
     this.stopRequested = true;
+    await this.loopPromise?.catch(() => {});
     const deadline = this.qw.clock() + this.qw.shutdownDeadlineMs;
     while (this.inflight.size > 0 && this.qw.clock() < deadline) {
       await sleep(25);
@@ -401,22 +414,33 @@ export class Worker {
     this.timers = [];
     if (this.scheduler) await this.scheduler.stop();
     this.running = false;
-    await this.loopPromise?.catch(() => {});
     this.qw.logger.info("worker stopped", { module: "worker", kv: { workerId: this.workerId } });
   }
 
-  /** Blocks until SIGINT/SIGTERM. */
+  /** Blocks until SIGINT/SIGTERM, then shuts down gracefully. */
   async runUntilSignal(signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM"]): Promise<void> {
-    this.start();
-    let fired = false;
-    await new Promise<void>((resolve) => {
-      const onSignal = (): void => {
-        if (fired) return;
-        fired = true;
-        resolve();
-      };
-      for (const s of signals) process.on(s, onSignal);
-    }).then(() => this.stop());
+    let stopping = false;
+    const onSignal = (): void => {
+      if (stopping) return;
+      stopping = true;
+      void this.stop().catch(() => {});
+    };
+    for (const s of signals) process.on(s, onSignal);
+    try {
+      this.start();
+      await new Promise<void>((resolve) => {
+        const check = setInterval(() => {
+          if (stopping && !this.running && this.inflight.size === 0) {
+            clearInterval(check);
+            resolve();
+          }
+        }, 100);
+        check.unref?.();
+      });
+    } finally {
+      for (const s of signals) process.off(s, onSignal);
+      if (!stopping) await this.stop().catch(() => {});
+    }
   }
 }
 

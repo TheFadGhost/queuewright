@@ -1,7 +1,4 @@
-import type {
-  JobRecord,
-  RetryPolicy,
-} from "../types.js";
+import type { JobRecord } from "../types.js";
 import { MAX_ATTEMPTS_HISTORY, MAX_EVENTS_PER_JOB } from "../types.js";
 import type { ConcurrencyLimit, RateLimitRule } from "./interface.js";
 
@@ -91,9 +88,21 @@ export function newAttemptRecord(job: JobRecord, startedAt: number): void {
   }
 }
 
-export const DEFAULT_RETRY_SNAPSHOT: RetryPolicy = {
-  strategy: "exponential",
-  baseDelayMs: 1000,
-  maxDelayMs: 60000,
-  jitter: "full",
-};
+/** Opaque pagination token that survives the referenced row being purged. */
+export function encodeCursor(createdAt: number, id: string): string {
+  return Buffer.from(`${createdAt}:${id}`, "utf8").toString("base64url");
+}
+
+export function decodeCursor(token: string): { createdAt: number; id: string } | null {
+  try {
+    const raw = Buffer.from(token, "base64url").toString("utf8");
+    const sep = raw.indexOf(":");
+    if (sep <= 0) return null;
+    const createdAt = Number(raw.slice(0, sep));
+    const id = raw.slice(sep + 1);
+    if (!Number.isFinite(createdAt) || id.length === 0) return null;
+    return { createdAt, id };
+  } catch {
+    return null;
+  }
+}

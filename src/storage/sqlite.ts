@@ -19,6 +19,8 @@ import type {
 } from "../types.js";
 import { assertTransition } from "../state-machine.js";
 import {
+  DuplicateScheduleError,
+  ScheduleNotFoundError,
   DuplicateJobError,
   JobNotFoundError,
   LeaseLostError,
@@ -33,7 +35,7 @@ import type {
   StorageBackend,
   UpdatePayloadInput,
 } from "./interface.js";
-import { concurrencyAllows, decideFailTarget, newAttemptRecord, pushEvent, rulesForJob, takeBucket, type BucketState } from "./shared.js";
+import { concurrencyAllows, decideFailTarget, decodeCursor, encodeCursor, newAttemptRecord, pushEvent, rulesForJob, takeBucket, type BucketState } from "./shared.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS qw_jobs (
@@ -184,10 +186,12 @@ export class SqliteStorage implements StorageBackend {
     this.db.exec(SCHEMA);
   }
 
-  async close(): Promise<void> {
-    if (!this.closed) {
+async close(): Promise<void> {
+    if (!this.closed && this.db) {
       this.closed = true;
       this.db.close();
+    } else {
+      this.closed = true;
     }
   }
 
@@ -284,12 +288,12 @@ export class SqliteStorage implements StorageBackend {
       params.push(query.type);
     }
     if (query.search) {
-      where.push("(id LIKE ? OR type LIKE ? OR payload LIKE ?)");
+      where.push("(id LIKE ? ESCAPE '\\' OR type LIKE ? ESCAPE '\\' OR payload LIKE ? ESCAPE '\\')");
       const like = `%${escapeLike(query.search)}%`;
       params.push(like, like, like);
     }
     if (query.cursor) {
-      const cur = this.getJobInTx(query.cursor);
+      const cur = decodeCursor(query.cursor);
       if (cur) {
         const cmp = query.order === "created_asc" ? ">" : "<";
         where.push(`(created_at ${cmp} ? OR (created_at = ? AND id ${cmp} ?))`);
@@ -302,7 +306,8 @@ export class SqliteStorage implements StorageBackend {
     const rows = this.db.prepare(sql).all(...params, query.limit + 1) as unknown as JobRow[];
     const hasMore = rows.length > query.limit;
     const page = rows.slice(0, query.limit).map(rowToJob);
-    return { jobs: page, cursor: hasMore && page.length > 0 ? page[page.length - 1]!.id : null };
+    const last = page[page.length - 1];
+    return { jobs: page, cursor: hasMore && last ? encodeCursor(last.createdAt, last.id) : null };
   }
 
   async claim(req: ClaimRequest): Promise<JobRecord[]> {
@@ -456,15 +461,16 @@ export class SqliteStorage implements StorageBackend {
     return target;
   }
 
-  async heartbeat(jobId: string, workerId: string, untilMs: number): Promise<void> {
+  async heartbeat(jobId: string, workerId: string, untilMs: number, windowMs: number): Promise<void> {
     this.assertOpen();
     this.tx(() => {
       this.requireLeaseInTx(jobId, workerId);
+      const capped = Math.min(untilMs, this.now() + windowMs);
       this.db
         .prepare(
           `UPDATE qw_jobs SET lease_until=MAX(COALESCE(lease_until,0),?), updated_at=? WHERE id=? AND state='running' AND lease_owner=?`,
         )
-        .run(untilMs, this.now(), jobId, workerId);
+        .run(capped, this.now(), jobId, workerId);
       const changes = this.db.prepare(`SELECT changes() AS c`).get() as { c: number };
       if (changes.c !== 1) throw new LeaseLostError(jobId, workerId);
     });
@@ -587,14 +593,14 @@ export class SqliteStorage implements StorageBackend {
   async purgeRetention(olderThanMs: number): Promise<number> {
     this.assertOpen();
     return this.tx(() => {
-      const r = this.db
+      this.db
         .prepare(
           `DELETE FROM qw_jobs WHERE state IN ('succeeded','failed','dead','cancelled') AND updated_at<?`,
         )
         .run(olderThanMs);
       const c = this.db.prepare(`SELECT changes() AS c`).get() as { c: number };
       this.db.prepare(`DELETE FROM qw_completions WHERE finished_at<?`).run(olderThanMs);
-      void r;
+      this.db.prepare(`DELETE FROM qw_idempotency WHERE status='pending'`).run();
       return c.c;
     });
   }
@@ -669,13 +675,16 @@ export class SqliteStorage implements StorageBackend {
   async beginIdempotency(key: string): Promise<IdempotencyOutcome<string>> {
     this.assertOpen();
     return this.tx(() => {
+      const row = this.db.prepare(`SELECT status, result FROM qw_idempotency WHERE key=?`).get(key) as
+        | { status: string; result: string | null }
+        | undefined;
+      if (row?.status === "done") return { status: "done", result: row.result! } as const;
+      if (row?.status === "pending") return { status: "busy" } as const;
       try {
         this.db.prepare(`INSERT INTO qw_idempotency (key, status, result) VALUES (?,'pending',NULL)`).run(key);
         return { status: "run" } as const;
       } catch {
-        const row = this.db.prepare(`SELECT status, result FROM qw_idempotency WHERE key=?`).get(key) as { status: string; result: string | null };
-        if (row?.status === "done") return { status: "done", result: row.result! } as const;
-        return { status: "run" } as const;
+        return { status: "busy" } as const;
       }
     });
   }
@@ -707,11 +716,11 @@ export class SqliteStorage implements StorageBackend {
     this.assertOpen();
     return this.tx(() => {
       const existing = this.getScheduleInTx(input.id);
-      if (existing) throw new Error(`schedule "${input.id}" already exists`);
+      if (existing) throw new DuplicateScheduleError(input.id);
       this.db
         .prepare(
-          `INSERT INTO qw_schedules (id, cron, timezone, job_type, queue, payload, priority, max_attempts, timeout_ms, retry_json, on_missed, created_at, paused, last_fired_at, next_fire_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)`,
+          `INSERT INTO qw_schedules (id, cron, timezone, job_type, queue, payload, priority, max_attempts, timeout_ms, retry_json, on_missed, created_at, paused)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         )
         .run(
           input.id, input.cron, input.timezone, input.jobType, input.queue, input.payload,
@@ -726,7 +735,7 @@ export class SqliteStorage implements StorageBackend {
     this.assertOpen();
     return this.tx(() => {
       const existing = this.getScheduleInTx(id);
-      if (!existing) throw new JobNotFoundError(id);
+      if (!existing) throw new ScheduleNotFoundError(id);
       const merged = { ...existing, ...patch };
       this.db
         .prepare(
@@ -766,11 +775,17 @@ export class SqliteStorage implements StorageBackend {
     return row ? rowToSchedule(row) : undefined;
   }
 
-  async recordScheduleFires(scheduleId: string, fireTimes: number[], nextFireAt: number): Promise<JobRecord[]> {
+  async recordScheduleFires(
+    scheduleId: string,
+    fireTimes: number[],
+    nextFireAt: number,
+    expectedPrevFireAt: number | null,
+  ): Promise<JobRecord[]> {
     this.assertOpen();
     return this.tx(() => {
       const sched = this.getScheduleInTx(scheduleId);
-      if (!sched) throw new JobNotFoundError(scheduleId);
+      if (!sched) throw new ScheduleNotFoundError(scheduleId);
+      if (sched.nextFireAt !== expectedPrevFireAt) return [];
       const t = this.now();
       const created: JobRecord[] = [];
       for (const fireAt of fireTimes) {
@@ -812,9 +827,14 @@ export class SqliteStorage implements StorageBackend {
     });
   }
 
-  async setRateRules(rules: RateLimitRule[]): Promise<void> {
+async setRateRules(rules: RateLimitRule[]): Promise<void> {
     this.assertOpen();
     this.metaSet("rateRules", JSON.stringify(rules));
+    const keep = new Set(rules.map((r) => r.key));
+    const rows = this.db.prepare(`SELECT key FROM qw_rate_buckets`).all() as Array<{ key: string }>;
+    for (const row of rows) {
+      if (!keep.has(row.key)) this.db.prepare(`DELETE FROM qw_rate_buckets WHERE key=?`).run(row.key);
+    }
   }
 
   async getRateRules(): Promise<RateLimitRule[]> {

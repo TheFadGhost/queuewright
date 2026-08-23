@@ -24,6 +24,7 @@ export async function runWorkerMain(argv: string[] = process.argv.slice(2)): Pro
   const worker = qw.createWorker();
 
   let dashboardUrl: string | null = null;
+  let dashboardRef: DashboardServer | null = null;
   if (config.dashboard !== false && !flag("--no-dashboard")) {
     const dashCfg = config.dashboard ?? {};
     const assetsDir = join(dirname(fileURLToPath(import.meta.url)), "..", "dashboard-assets");
@@ -31,6 +32,7 @@ export async function runWorkerMain(argv: string[] = process.argv.slice(2)): Pro
       port: dashCfg.port ?? DEFAULTS.dashboardPort,
       host: dashCfg.host ?? DEFAULTS.dashboardHost,
     });
+    dashboardRef = dashboard;
     try {
       const addr = await dashboard.start();
       dashboardUrl = `http://${addr.host === "127.0.0.1" ? "localhost" : addr.host}:${addr.port}`;
@@ -45,8 +47,12 @@ export async function runWorkerMain(argv: string[] = process.argv.slice(2)): Pro
     module: "worker-main",
     kv: { concurrency: qw.concurrency, dashboard: dashboardUrl ?? "off" },
   });
-  await worker.runUntilSignal();
-  await qw.close();
+try {
+    await worker.runUntilSignal();
+  } finally {
+    if (dashboardRef) await dashboardRef.stop();
+    await qw.close();
+  }
   return 0;
 }
 

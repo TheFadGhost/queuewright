@@ -4,7 +4,7 @@ import {
   type QueuewrightConfig,
   type ScheduleInput,
 } from "./config.js";
-import { InvalidCronError, PayloadTooLargeError, UnregisteredJobTypeError } from "./errors.js";
+import { InvalidCronError, ConfigValidationError, InvalidNameError, InvalidTimezoneError, PayloadTooLargeError, UnregisteredJobTypeError } from "./errors.js";
 import { isValidTimezone, parseCron } from "./cron.js";
 import { Logger } from "./observability/logger.js";
 import { MetricsRegistry } from "./observability/metrics.js";
@@ -63,11 +63,16 @@ export class Queuewright {
     if (config.storageInstance === undefined) validateConfig(config);
     const storageCfg = config.storage ?? { kind: "sqlite" as const };
     this.ownsStorage = config.storageInstance === undefined;
-    this.storage =
-      config.storageInstance ??
-      (storageCfg.kind === "memory"
-        ? new MemoryStorage()
-        : new SqliteStorage({ file: storageCfg.file ?? "./data/queuewright.db" }));
+    if (config.storageInstance !== undefined) {
+      this.storage = config.storageInstance;
+    } else if (storageCfg.kind === "memory") {
+      this.storage = config.now ? new MemoryStorage({ now: config.now }) : new MemoryStorage();
+    } else {
+      this.storage = new SqliteStorage({
+        file: storageCfg.file ?? "./data/queuewright.db",
+        ...(config.now ? { now: config.now } : {}),
+      });
+    }
     this.queues = config.queues ?? [];
     this.clock = config.now ?? Date.now;
     this.logger = new Logger(config.log ?? {});
@@ -121,10 +126,19 @@ export class Queuewright {
   async rawEnqueue(
     type: string,
     payloadJson: string,
-    opts: EnqueueOptions & { queue?: string; maxAttempts?: number; timeoutMs?: number; retry?: RetryPolicy } = {},
+    opts: EnqueueOptions & {
+      queue?: string;
+      maxAttempts?: number;
+      timeoutMs?: number;
+      retry?: RetryPolicy;
+      allowUnregistered?: boolean;
+    } = {},
   ): Promise<JobRecord> {
     const def = findDefinition(type);
-    if (!def) throw new UnregisteredJobTypeError(type, []);
+    if (!def) {
+      if (opts.allowUnregistered !== true) throw new UnregisteredJobTypeError(type, []);
+    }
+    validateRawEnqueue(type, payloadJson, opts);
     return this.enqueueRecord(type, def, payloadJson, undefined, opts);
   }
 
@@ -133,7 +147,7 @@ export class Queuewright {
     def: JobDefinition<never> | undefined,
     payloadJson: string,
     payload: unknown,
-    opts: EnqueueOptions & { queue?: string; maxAttempts?: number; timeoutMs?: number; retry?: RetryPolicy },
+    opts: EnqueueOptions & { queue?: string; maxAttempts?: number; timeoutMs?: number; retry?: RetryPolicy; allowUnregistered?: boolean },
   ): Promise<JobRecord> {
     assertPayloadSize(this.maxPayloadBytes, type, payloadJson);
     if (def && payload !== undefined) validate(def, payload);
@@ -250,7 +264,10 @@ export class Queuewright {
   async createSchedule(input: ScheduleInput): Promise<ScheduleRecord> {
     parseCron(input.cron);
     const tz = input.timezone ?? "UTC";
-    if (!isValidTimezone(tz)) throw new InvalidCronError(input.cron, `unknown timezone "${tz}"`);
+    if (!isValidTimezone(tz)) throw new InvalidTimezoneError(tz);
+    if (!/^[a-z0-9][a-z0-9-_]*$/.test(input.id)) {
+      throw new InvalidNameError("schedule id", input.id, "[a-z0-9][a-z0-9-_]*");
+    }
     if (!findDefinition(input.jobType)) throw new UnregisteredJobTypeError(input.jobType, []);
     const upsert: ScheduleUpsertInput = {
       id: input.id,
@@ -261,7 +278,7 @@ export class Queuewright {
       payload: JSON.stringify(input.payload ?? {}),
       priority: input.priority ?? 0,
       maxAttempts: input.maxAttempts ?? 3,
-      timeoutMs: input.timeoutMs ?? DEFAULTS.visibilityTimeoutMs,
+      timeoutMs: input.timeoutMs ?? 30_000,
       retry: { strategy: "exponential", baseDelayMs: 1000, maxDelayMs: 60_000, jitter: "full" },
       onMissed: input.onMissed ?? "run_once",
       paused: input.paused ?? false,
@@ -283,10 +300,33 @@ export class Queuewright {
     return worker;
   }
 
+  /**
+   * Apply rate rules, concurrency limits and config-file schedules. Throws
+   * ConfigValidationError listing every schedule that could not be created -
+   * startup problems are never silently swallowed.
+   */
   async applyStartupRules(config: QueuewrightConfig): Promise<void> {
     if (config.rateRules) await this.setRateRules(config.rateRules);
     if (config.concurrencyLimits) await this.setConcurrencyLimits(config.concurrencyLimits);
-    for (const s of config.schedules ?? []) await this.createSchedule(s).catch(() => {});
+    const failures: string[] = [];
+    for (const s of config.schedules ?? []) {
+      try {
+        await this.createSchedule(s);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        failures.push(`schedules["${s.id}"]: ${msg.split("\n")[0]}`);
+      }
+    }
+    if (failures.length > 0) {
+      throw new ConfigValidationError(
+        failures.map((f) => ({
+          path: f.slice(0, f.indexOf(":")),
+          expected: "a creatable schedule",
+          got: f.slice(f.indexOf(":") + 2),
+          fix: "correct the cron expression, timezone or duplicate id; existing schedules with the same id are kept",
+        })),
+      );
+    }
   }
 }
 
@@ -306,6 +346,41 @@ function assertPayloadSize(maxBytes: number, type: string, json: string): void {
   const size = Buffer.byteLength(json, "utf8");
   if (size > maxBytes) throw new PayloadTooLargeError(type, size, maxBytes, null);
 }
+
+const QUEUE_NAME_RE = /^[a-z0-9][a-z0-9-_]*$/;
+
+/** Boundary validation for raw (string-typed) enqueues from ops tools. */
+export function validateRawEnqueue(
+  type: string,
+  payloadJson: string,
+  opts: { queue?: string; maxAttempts?: number; timeoutMs?: number; priority?: number },
+): void {
+  if (!JOB_TYPE_RE.test(type)) {
+    throw new InvalidNameError("job type", type, String(JOB_TYPE_RE));
+  }
+  try {
+    JSON.parse(payloadJson);
+  } catch (e) {
+    throw new Error(
+      `payload for job type "${type}" is not valid JSON: ${e instanceof Error ? e.message : String(e)}. fix: pass compact JSON in --payload, e.g. '{"userId":"u_1"}'`,
+    );
+  }
+  const queue = opts.queue ?? "default";
+  if (!QUEUE_NAME_RE.test(queue)) {
+    throw new InvalidNameError("queue name", queue, "[a-z0-9][a-z0-9-_]*");
+  }
+  if (opts.priority !== undefined && !Number.isInteger(opts.priority)) {
+    throw new Error(`priority must be an integer, got ${opts.priority}. fix: omit --priority or pass a whole number`);
+  }
+  if (opts.maxAttempts !== undefined && (!Number.isInteger(opts.maxAttempts) || opts.maxAttempts < 1 || opts.maxAttempts > 1000)) {
+    throw new Error(`maxAttempts must be an integer in [1,1000], got ${opts.maxAttempts}. fix: omit it to use the job definition's value or the default (3)`);
+  }
+  if (opts.timeoutMs !== undefined && (!Number.isInteger(opts.timeoutMs) || opts.timeoutMs < 1)) {
+    throw new Error(`timeoutMs must be a positive integer, got ${opts.timeoutMs}. fix: omit it to use the default (30000)`);
+  }
+}
+
+const JOB_TYPE_RE = /^[a-z0-9][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)+$/;
 
 function validate(def: JobDefinition<never>, payload: unknown): void {
   const v = def.options.validate;

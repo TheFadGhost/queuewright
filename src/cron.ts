@@ -268,6 +268,3 @@ export function nextFireAfter(parsed: ParsedCron, tz: string, afterUtcMs: number
   return null;
 }
 
-export function describeCron(parsed: ParsedCron): string {
-  return parsed.expression;
-}

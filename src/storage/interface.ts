@@ -122,7 +122,7 @@ export interface StorageBackend {
    */
   failAttempt(input: FailAttemptInput): Promise<"retrying" | "dead" | "failed">;
 
-  heartbeat(jobId: string, workerId: string, untilMs: number): Promise<void>;
+  heartbeat(jobId: string, workerId: string, untilMs: number, windowMs: number): Promise<void>;
 
   /** Requeue running jobs whose lease expired; returns count reclaimed. */
   reclaimExpired(): Promise<number>;
@@ -141,8 +141,6 @@ export interface StorageBackend {
   stats(): Promise<SystemStats>;
   completionSamples(fromMs: number, toMs: number): Promise<CompletionSample[]>;
 
-  takeRateToken(key: string, limit: number, windowMs: number): Promise<boolean>;
-
   beginIdempotency(key: string): Promise<IdempotencyOutcome<string>>;
   completeIdempotency(key: string, result: string): Promise<void>;
   releaseIdempotency(key: string): Promise<void>;
@@ -154,11 +152,17 @@ export interface StorageBackend {
   deleteSchedule(id: string): Promise<void>;
   listSchedules(): Promise<ScheduleRecord[]>;
   getSchedule(id: string): Promise<ScheduleRecord | null>;
-  /** Atomically record fires and enqueue one job per fire time; returns created jobs. */
+  /**
+   * Atomically record fires and enqueue one job per fire time, guarded by a
+   * compare-and-set on the previously observed nextFireAt (null = was unset).
+   * When another writer already advanced the schedule, returns [] without
+   * enqueueing anything. Returns the created jobs on success.
+   */
   recordScheduleFires(
     scheduleId: string,
     fireTimes: number[],
     nextFireAt: number,
+    expectedPrevFireAt: number | null,
   ): Promise<JobRecord[]>;
 
   setPaused(control: PauseControl): Promise<void>;

@@ -202,10 +202,10 @@ export function runConformanceSuite(makeBackend: (clock: FakeClock) => Promise<S
       await store.enqueue(input());
       const [job] = await store.claim({ workerId: "w1", queues: ["default"], limit: 1, visibilityTimeoutMs: 1000 });
       clock.advance(900);
-      await store.heartbeat(job!.id, "w1", clock.now() + 5000);
+      await store.heartbeat(job!.id, "w1", clock.now() + 5000, 60_000);
       clock.advance(3000);
       expect(await store.reclaimExpired()).toBe(0);
-      await expect(store.heartbeat(job!.id, "other", clock.now())).rejects.toThrow(/lease/i);
+      await expect(store.heartbeat(job!.id, "other", clock.now(), 60_000)).rejects.toThrow(/lease/i);
       await close();
     });
 

@@ -244,6 +244,10 @@ function cell(text: string, state?: JobState): Cell {
   return state === undefined ? { t: text } : { t: text, s: state };
 }
 
+function stateCell(state: JobState): Cell {
+  return { t: stateWord(state), s: state };
+}
+
 function renderTable(headers: string[], rows: Cell[][], right: boolean[] = []): string[] {
   const widths = headers.map((h, i) =>
     Math.max(h.length, ...rows.map((r) => r[i]?.t.length ?? 0)),
@@ -601,7 +605,7 @@ async function cmdList(args: ParsedArgs, globals: Globals): Promise<number> {
         renderTable(
           ["state", "id", "type", "queue", "att", "next_run_or_finished", "created"],
           page.jobs.map((j) => [
-            cell(j.state, j.state),
+            stateCell(j.state),
             cell(truncateMiddle(j.id, 17)),
             cell(truncateMiddle(j.type, 28)),
             cell(j.queue),
@@ -736,6 +740,19 @@ async function cmdStats(_args: ParsedArgs, globals: Globals): Promise<number> {
           [false, true, true, true],
         ),
       );
+    }
+    const now = Date.now();
+    const samples = await qw.completionSamples(now - 3_600_000, now);
+    if (samples.length > 0) {
+      const sorted = samples.map((s) => s.durationMs).sort((a, b) => a - b);
+      const pct = (q: number): number => sorted[Math.min(sorted.length - 1, Math.ceil(q * sorted.length) - 1)]!;
+      lines.push(
+        "",
+        `LATENCY (last hour, ${sorted.length} completions)`,
+        `  p50=${pct(0.5)}ms  p95=${pct(0.95)}ms  p99=${pct(0.99)}ms`,
+      );
+    } else {
+      lines.push("", "LATENCY (last hour)", "  no completions in this window");
     }
     printLines(lines);
     return 0;
@@ -1008,7 +1025,7 @@ const COMMANDS: Record<string, CommandSpec> = {
   cancel: {
     usageLine: "qw cancel <job-id>",
     summary: "Cancel a pending or running job.",
-    detail: ["exit codes: 0 cancelled | 1 job not found / illegal transition target | 2 bad flags"],
+    detail: ["exit codes: 0 cancelled | 1 job not found | 2 bad flags or illegal transition (state machine rejects it)"],
     flags: NO_FLAGS,
     run: (ctx) => cmdCancel(ctx.args, ctx.globals),
   },

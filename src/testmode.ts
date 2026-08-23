@@ -1,4 +1,4 @@
-import { findDefinition, type Handler, type JobContext, type JobDefinition } from "./registry.js";
+import { type Handler, type JobContext, type JobDefinition } from "./registry.js";
 import { nextRetryDelayMs, SeededRng } from "./retry.js";
 import { FatalJobError, DuplicateJobError } from "./errors.js";
 import type { AttemptRecord, JobRecord, LifecycleEvent } from "./types.js";
@@ -78,7 +78,7 @@ export function createTestClient(options: { definitions: JobDefinition<never>[];
       if (run.dedupeKey) activeDedupe.delete(run.dedupeKey);
     } catch (e) {
       const fatal = e instanceof FatalJobError;
-      rec.outcome = fatal ? "failed" : "failed";
+      rec.outcome = "failed";
       rec.finishedAt = now;
       rec.errorName = e instanceof Error ? e.name : "NonErrorThrow";
       rec.errorMessage = e instanceof Error ? e.message : String(e);
@@ -135,7 +135,6 @@ export function createTestClient(options: { definitions: JobDefinition<never>[];
         dedupeKey: opts.dedupeKey ?? null,
         createdAt: seq - 1,
       });
-      if (!opts.delayMs) void 0;
       return id;
     },
     async advance(ms) {
@@ -172,4 +171,3 @@ export function createTestClient(options: { definitions: JobDefinition<never>[];
   }
 }
 
-void findDefinition;

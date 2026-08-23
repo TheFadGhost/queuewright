@@ -1,0 +1,3 @@
+{
+  "storage": { "kind": "sqlite", "file": "./scratch-qw.db" }
+}

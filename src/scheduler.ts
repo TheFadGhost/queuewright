@@ -42,9 +42,13 @@ export class Scheduler {
     this.timer = null;
   }
 
-  async tick(): Promise<void> {
+async tick(): Promise<void> {
     const now = this.qw.clock();
     const schedules = await this.qw.listSchedules();
+    const known = new Set(schedules.map((s) => s.id));
+    for (const id of [...this.parsed.keys()]) {
+      if (!known.has(id)) this.parsed.delete(id);
+    }
     for (const sched of schedules) {
       await this.processSchedule(sched, now);
     }
@@ -69,7 +73,7 @@ export class Scheduler {
       const base = Math.max(now, sched.lastFiredAt ?? now);
       nextFireAt = nextFireAfter(parsed, sched.timezone, base);
       if (nextFireAt === null) return;
-      await this.qw.storage.recordScheduleFires(sched.id, [], nextFireAt);
+      await this.qw.storage.recordScheduleFires(sched.id, [], nextFireAt, null);
       return;
     }
     if (sched.paused || nextFireAt > now) return;
@@ -87,8 +91,8 @@ export class Scheduler {
         fireTimes = missed.all.length > 0 ? [missed.all[missed.all.length - 1]!] : [nextFireAt];
         break;
     }
-    await this.qw.storage.recordScheduleFires(sched.id, fireTimes, missed.next);
-    if (fireTimes.length > 0) {
+    const created = await this.qw.storage.recordScheduleFires(sched.id, fireTimes, missed.next, sched.nextFireAt);
+    if (created.length > 0) {
       this.qw.metrics.inc("qw_schedule_fires_total", [["schedule", sched.id]], fireTimes.length);
       this.qw.logger.info("schedule fired", {
         module: "scheduler",

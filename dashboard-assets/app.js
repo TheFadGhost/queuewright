@@ -269,20 +269,29 @@ function renderSummary(data) {
     host.appendChild(item);
   });
 
-  let thr = null, p95 = null;
+  let thr = null, p95 = null, p95Note = "no completions";
   const pts = state.series && state.series.points;
   if (pts) {
     let tot = 0;
     pts.forEach(function (p) { tot += p.succeeded || 0; });
     thr = tot / (state.windowMs / 60000);
-    p95 = median(pts.map(function (p) { return p.durationsP95; }).filter(function (v) { return v != null; }));
+    // The most recent completed bucket's true p95 - not a median of bucket
+    // p95s, which would understate the tail.
+    for (let i = pts.length - 1; i >= 0; i--) {
+      if (pts[i] && pts[i].durationsP95 != null) {
+        p95 = pts[i].durationsP95;
+        p95Note = "last completed minute";
+        break;
+      }
+    }
   }
   [["throughput", "THROUGHPUT/MIN", thr == null ? "-" : (Math.round(thr * 10) / 10).toFixed(1)],
-   ["latency", "LATENCY P95", p95 == null ? "-" : fmtDur(p95)]].forEach(function (s) {
+   ["latency", "LATENCY P95", p95 == null ? "-" : fmtDur(p95), p95 == null ? "" : "p95 over " + p95Note]].forEach(function (s) {
     const item = ce("div", "summary-item");
     item.dataset.stat = s[0];
     item.appendChild(ce("span", "s-label", s[1]));
     item.appendChild(ce("span", "s-value", s[2]));
+    if (s[3]) item.title = s[3];
     host.appendChild(item);
   });
     syncSummaryPressed();
@@ -395,11 +404,39 @@ function renderThroughputChart(series) {
     if (p.missing) return;
     const x = c.plot.x + i * bw + gap / 2, w = Math.max(bw - gap, 1);
     const succ = p.succeeded || 0, fail = p.failed || 0;
-    if (fail > 0) bars.appendChild(sv("rect", { x: x, y: c.plot.y + c.plot.h - ((succ + fail) / yMax) * c.plot.h, width: w, height: (fail / yMax) * c.plot.h, fill: "var(--st-failed)" }));
+    if (fail > 0) {
+      // Failed segments carry a dashed outline in addition to colour so the
+      // split is legible without hue (colourblind-safe requirement).
+      bars.appendChild(sv("rect", { x: x, y: c.plot.y + c.plot.h - ((succ + fail) / yMax) * c.plot.h, width: w, height: (fail / yMax) * c.plot.h, fill: "var(--st-failed)", stroke: "var(--fg)", "stroke-width": "1", "stroke-dasharray": "2 1" }));
+    }
     if (succ > 0) bars.appendChild(sv("rect", { x: x, y: c.plot.y + c.plot.h - (succ / yMax) * c.plot.h, width: w, height: (succ / yMax) * c.plot.h, fill: "var(--st-succeeded)" }));
   });
   c.svg.appendChild(bars);
   host.appendChild(c.svg);
+  renderThroughputLegend(host);
+}
+
+function renderThroughputLegend(afterEl) {
+  let legend = qs("#legend-throughput");
+  if (!legend) {
+    legend = ce("div");
+    legend.id = "legend-throughput";
+    legend.className = "legend";
+    afterEl.insertAdjacentElement("afterend", legend);
+  }
+  legend.textContent = "";
+  [["succeeded", "var(--st-succeeded)"], ["failed", "var(--st-failed)"]].forEach(function (it) {
+    const span = ce("span");
+    const s = sv("svg", { width: 12, height: 12, viewBox: "0 0 12 12", "aria-hidden": "true", focusable: "false" });
+    if (it[0] === "succeeded") {
+      s.appendChild(sv("rect", { x: 1, y: 1, width: 10, height: 10, fill: it[1] }));
+    } else {
+      s.appendChild(sv("rect", { x: 1, y: 1, width: 10, height: 10, fill: it[1], stroke: "var(--fg)", "stroke-width": "1", "stroke-dasharray": "2 1" }));
+    }
+    span.appendChild(s);
+    span.appendChild(document.createTextNode(" " + it[0]));
+    legend.appendChild(span);
+  });
 }
 
 const LAT_KEYS = ["durationsP50", "durationsP95", "durationsP99"];
@@ -537,8 +574,15 @@ function nextRunCell(job) {
   const ts = TERMINAL_STATES.has(job.state)
     ? ((job.attemptsHistory || []).length ? job.attemptsHistory[job.attemptsHistory.length - 1].finishedAt : null) || job.updatedAt
     : job.runAt;
-  td.textContent = ts != null ? fmtDT(ts) : "-";
-  td.title = ts != null ? fmtAbs(ts) + " (" + rel(ts) + ")" : "";
+  if (ts != null) {
+    // Absolute with explicit timezone, relative form visible beneath - never ambiguous.
+    td.appendChild(document.createTextNode(fmtDT(ts) + " UTC"));
+    const relSpan = ce("span", "ts-rel", rel(ts));
+    td.appendChild(relSpan);
+    td.title = fmtAbs(ts) + " UTC";
+  } else {
+    td.textContent = "-";
+  }
   return td;
 }
 
@@ -581,8 +625,13 @@ function jobRow(job) {
   tr.appendChild(ce("td", "num mono", (job.attempts != null ? job.attempts : 0) + "/" + (job.maxAttempts != null ? job.maxAttempts : "?")));
   tr.appendChild(nextRunCell(job));
   tr.appendChild(durationCell(job));
-  const tdC = ce("td", "num mono", job.createdAt != null ? fmtDT(job.createdAt) : "-");
-  tdC.title = job.createdAt != null ? fmtAbs(job.createdAt) + " (" + rel(job.createdAt) + ")" : "";
+  const tdC = ce("td", "num mono");
+  if (job.createdAt != null) {
+    tdC.appendChild(document.createTextNode(fmtDT(job.createdAt) + " UTC"));
+    tdC.title = fmtAbs(job.createdAt) + " UTC (" + rel(job.createdAt) + ")";
+  } else {
+    tdC.textContent = "-";
+  }
   tr.appendChild(tdC);
   tr.addEventListener("click", function () { selectRow(tr.dataset.id, false); });
   return tr;
@@ -772,7 +821,8 @@ function renderDetail(job) {
     fill.style.width = (frac * 100).toFixed(1) + "%";
     track.appendChild(fill);
     pd.appendChild(track);
-    pd.appendChild(document.createTextNode(" " + Math.round(frac * 100) + "%"));
+    const pctSpan = ce("span", "num", " " + Math.round(frac * 100) + "%");
+    pd.appendChild(pctSpan);
     if (job.progress.note) pd.appendChild(ce("span", "muted", " " + job.progress.note));
     if (job.progress.at) pd.appendChild(absRelNode(job.progress.at));
     detailField(dl, "Progress", pd);
@@ -1083,6 +1133,7 @@ async function refreshAll(manual) {
   try {
     await Promise.all(tasks);
     state.pollFailShown = false;
+    hideBanner();
     setStale(false);
     setLastRefreshed();
   } catch (err) {

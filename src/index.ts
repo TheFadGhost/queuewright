@@ -27,7 +27,6 @@ export {
 export { Queuewright, type EnqueueOptions } from "./client.js";
 export { createTestClient, type TestClient } from "./testmode.js";
 export { runIdempotent } from "./idempotency.js";
-export { FatalJobError } from "./errors.js";
 export { parseCron, nextFireAfter, isValidTimezone, wallToUtc, type ParsedCron } from "./cron.js";
 export { nextRetryDelayMs, rawDelay, SeededRng, type Rng } from "./retry.js";
 export { Logger, redactPayload, type LogLevel } from "./observability/logger.js";
