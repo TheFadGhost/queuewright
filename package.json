@@ -18,11 +18,10 @@
     "dashboard-assets"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && node scripts/copy-assets.mjs",
+    "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest",
-    "dev": "tsx"
+    "test:watch": "vitest"
   },
   "keywords": [
     "queue",

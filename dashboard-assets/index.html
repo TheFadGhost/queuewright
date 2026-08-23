@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Queuewright</title>
+<script>
+(function () {
+  var t = null;
+  try { t = localStorage.getItem("qw-theme"); } catch (e) {}
+  if (t !== "light" && t !== "dark" && t !== "high-contrast") {
+    t = (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
+  }
+  document.documentElement.setAttribute("data-theme", t);
+})();
+</script>
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="app-header">
+  <div class="header-row">
+    <span class="app-title">Queuewright</span>
+    <span id="system-status" class="sys-status" title="System status"></span>
+    <span class="hspace"></span>
+    <label class="live-label" for="live-toggle">
+      <input type="checkbox" id="live-toggle" checked>
+      Auto-refresh
+    </label>
+    <span id="last-refreshed" class="mono muted last-refreshed"></span>
+    <span id="stale-header" class="stale-marker" hidden>STALE</span>
+    <button id="global-pause-btn" type="button" class="btn">Pause all queues</button>
+    <label class="visually-hidden" for="theme-select">Theme</label>
+    <select id="theme-select">
+      <option value="light">Light</option>
+      <option value="dark">Dark</option>
+      <option value="high-contrast">High contrast</option>
+    </select>
+  </div>
+  <nav aria-label="Primary">
+    <ol class="crumbs">
+      <li><a href="#/jobs">Jobs</a></li>
+      <li id="crumb-current" class="muted" hidden></li>
+    </ol>
+  </nav>
+</header>
+
+<div id="banner" class="banner" role="status" hidden></div>
+
+<main id="main" tabindex="-1">
+
+  <section class="panel" aria-label="Queue summary">
+    <div id="summary-items" class="summary-items"></div>
+    <div id="queue-strip" class="queue-strip" aria-label="Queues"></div>
+  </section>
+
+  <section class="panel" aria-label="Charts">
+    <div class="charts-head">
+      <h2 class="section-title">Activity</h2>
+      <span id="stale-charts" class="stale-marker" hidden>STALE</span>
+      <span class="hspace"></span>
+      <div id="window-select" class="window-select" role="group" aria-label="Aggregation window"></div>
+    </div>
+    <div class="charts-row">
+      <figure class="chart-card">
+        <figcaption class="chart-title">Throughput</figcaption>
+        <div id="chart-throughput" class="chart-body"></div>
+        <p id="foot-throughput" class="chart-foot mono"></p>
+      </figure>
+      <figure class="chart-card">
+        <figcaption class="chart-title">Latency percentiles</figcaption>
+        <div id="legend-latency" class="legend"></div>
+        <div id="chart-latency" class="chart-body"></div>
+        <p id="foot-latency" class="chart-foot mono"></p>
+      </figure>
+    </div>
+  </section>
+
+  <section id="list-view" aria-label="Jobs">
+    <div class="filters">
+      <input id="filter-search" type="search" class="ctl" placeholder="Search id, type, error" aria-label="Search jobs">
+      <label class="visually-hidden" for="filter-state">State</label>
+      <select id="filter-state" class="ctl">
+        <option value="">All states</option>
+        <option value="queued">Queued</option>
+        <option value="scheduled">Scheduled</option>
+        <option value="running">Running</option>
+        <option value="succeeded">Succeeded</option>
+        <option value="retrying">Retrying</option>
+        <option value="failed">Failed</option>
+        <option value="dead">Dead</option>
+        <option value="cancelled">Cancelled</option>
+      </select>
+      <label class="visually-hidden" for="filter-queue">Queue</label>
+      <select id="filter-queue" class="ctl">
+        <option value="">All queues</option>
+      </select>
+      <label class="visually-hidden" for="filter-type">Type</label>
+      <select id="filter-type" class="ctl">
+        <option value="">All types</option>
+      </select>
+      <button id="clear-filters" type="button" class="btn">Clear filters</button>
+    </div>
+
+    <div class="table-wrap">
+      <table class="jobs-table">
+        <caption class="visually-hidden">Jobs, newest first by default</caption>
+        <thead>
+          <tr>
+            <th scope="col" class="col-state">State</th>
+            <th scope="col" class="col-id">ID</th>
+            <th scope="col" class="col-type">Type</th>
+            <th scope="col" class="col-queue">Queue</th>
+            <th scope="col" class="num col-att" data-sort="attempts" aria-sort="none">
+              <button type="button" class="th-btn">Attempts</button>
+            </th>
+            <th scope="col" class="col-next">Next run / finished</th>
+            <th scope="col" class="num col-dur" data-sort="duration" aria-sort="none">
+              <button type="button" class="th-btn">Duration</button>
+            </th>
+            <th scope="col" class="num col-created" data-sort="createdAt" aria-sort="descending">
+              <button type="button" class="th-btn">Created</button>
+            </th>
+          </tr>
+        </thead>
+        <tbody id="jobs-tbody"></tbody>
+      </table>
+    </div>
+    <div class="table-foot">
+      <span id="row-count" class="muted"></span>
+      <span id="stale-table" class="stale-marker" hidden>STALE</span>
+      <span class="hspace"></span>
+      <button id="load-more" type="button" class="btn" hidden>Load more</button>
+    </div>
+  </section>
+
+  <section id="detail-view" aria-label="Job detail" hidden></section>
+
+</main>
+
+<div id="modal-root"></div>
+<div id="live-region" class="visually-hidden" aria-live="polite"></div>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>

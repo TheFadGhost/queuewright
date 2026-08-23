@@ -1,0 +1,11 @@
+{
+  "storage": { "kind": "sqlite", "file": "./data/queuewright.db" },
+  "concurrency": 4,
+  "visibilityTimeoutMs": 30000,
+  "pollIntervalMs": 250,
+  "maxPayloadBytes": 262144,
+  "retentionMs": 604800000,
+  "log": { "level": "info" },
+  "dashboard": { "port": 7788, "host": "127.0.0.1" },
+  "_comment": "Copy to queuewright.json and adjust. Every field is optional; delete fields you do not need."
+}
