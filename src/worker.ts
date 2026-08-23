@@ -7,6 +7,7 @@ import type { Queuewright } from "./client.js";
 import { redactPayload } from "./observability/logger.js";
 import type { JobRecord } from "./types.js";
 import { Scheduler } from "./scheduler.js";
+import { runInThread, ThreadRunError, type ThreadExecutionSpec } from "./thread-runner.js";
 
 export class JobTimeoutError extends Error {
   constructor(jobId: string, ms: number) {
@@ -181,6 +182,34 @@ export class Worker {
         job.payloadVersion < def.options.version
       ) {
         payload = def.options.migrate(payload, job.payloadVersion);
+      }
+
+      if (def.options.execution !== "inline") {
+        const spec = def.options.execution as { thread: ThreadExecutionSpec };
+        clearTimeout(timeout!);
+        clearInterval(heartbeat);
+        try {
+          await runInThread(spec.thread, payload, timeoutMs);
+        } catch (e) {
+          timedOut = e instanceof ThreadRunError && e.message.includes("exceeded its");
+          await this.handleFailure(e, job, timedOut, jlog, timeoutMs);
+          return;
+        }
+        await this.storage.completeJob(job.id, this.workerId, null).catch((e2) => {
+          if (e2 instanceof LeaseLostError) {
+            jlog.warn("lost the lease; another worker owns this job now", { err: errFields(e2) });
+            return;
+          }
+          throw e2;
+        });
+        this.qw.metrics.inc("qw_jobs_completed_total", [
+          ["queue", job.queue],
+          ["type", job.type],
+          ["result", "succeeded"],
+        ]);
+        this.qw.metrics.observeDuration(job.queue, job.type, Date.now() - startedAt);
+        jlog.info("job completed (thread-isolated)", { attempt: job.attempts, durationMs: Date.now() - startedAt });
+        return;
       }
 
       const ctx: JobContext = {

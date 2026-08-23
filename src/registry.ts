@@ -26,6 +26,16 @@ export interface JobOptions {
   migrate?: (payload: any, fromVersion: number) => any;
   /** Enqueue the named job type after a successful run (single-successor continuation). */
   onSuccess?: { type: string; buildPayload: (result: void | unknown, sourcePayload: any) => unknown };
+  /**
+   * "inline" (default) races the handler against its timeout and aborts the
+   * signal; a synchronous spin-loop cannot be preempted in-process. Thread
+   * isolation runs the handler in a worker thread that is TERMINATED at the
+   * timeout, so even CPU-bound hangs cannot outlive their deadline. The
+   * handler must then live in a separate module with a named export.
+   */
+  execution?:
+    | "inline"
+    | { thread: { module: string; export: string } };
 }
 
 export interface ResolvedJobOptions {
@@ -38,6 +48,7 @@ export interface ResolvedJobOptions {
   version: number;
   migrate: ((payload: any, fromVersion: number) => any) | null;
   onSuccess: JobOptions["onSuccess"] | null;
+  execution: JobOptions["execution"];
 }
 
 export interface JobDefinition<P> {
@@ -61,6 +72,7 @@ export function resolveOptions(options: JobOptions = {}): ResolvedJobOptions {
     version: options.version ?? 1,
     migrate: options.migrate ?? null,
     onSuccess: options.onSuccess ?? null,
+    execution: options.execution ?? "inline",
   };
 }
 
