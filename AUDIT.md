@@ -116,5 +116,32 @@ After every fix round:
 
 ## Round 2
 
-Re-audit with fresh agents planned after round-1 fixes; v1.0.0 is tagged only
-on zero high/medium findings.
+Re-audit by a fresh verification agent confirmed the round-1 fixes in code and
+behavior, and caught three gaps plus two nits, all fixed:
+
+- [high] The CLI's enqueue path never actually passed `allowUnregistered` -
+  proven live with exit code 2 before the fix, exit 0 after (with a note that
+  the worker must register the type).
+- [medium] Thread-isolated completion faults were rethrown into the failure
+  path and burned attempts of successful jobs; both inline and thread paths
+  now treat completion-phase storage errors as framework errors, leaving the
+  lease for sweeper recovery.
+- [medium] Idempotency pending-lock purge was age-less; locks now carry
+  `created_at` (sqlite column added via PRAGMA-check + ALTER TABLE migration,
+  memory stamps), pending locks purge after one hour, done rows with retention.
+- [low] Traversal guard now implemented as documented (`path.relative`),
+  thread-path latency samples use the injected clock, dashboard Created column
+  shows a visible relative span, p95 summary title derives bucket length from
+  the window instead of hardcoding "minute".
+- Test robustness: the chaos shutdown test seeded real-time runAt values
+  against a frozen fake clock - claimability depended on millisecond timing.
+  All chaos inputs now stay on the injected timeline, and fault injection uses
+  a deterministic cadence so the stated injected-failure count is stable.
+
+Final state: fresh-agent verification PASS, full suite green on both backends
+(conformance, unit, integration, chaos incl. multi-process SIGKILL reclaim),
+typecheck clean, e2e smoke against the live dashboard passing. No open
+high/medium findings. v1.0.0 tagged.
+
+Note: the round-2 idempotency fix changes storage schema (qw_idempotency gains
+created_at; existing databases migrate automatically at init).

@@ -199,13 +199,21 @@ const log = this.qw.logger.child({ module: "worker" });
           await this.handleFailure(e, job, timedOut, jlog, timeoutMs, startedAt);
           return;
         }
-        await this.storage.completeJob(job.id, this.workerId, null).catch((e2) => {
+        try {
+          await this.storage.completeJob(job.id, this.workerId, null);
+        } catch (e2) {
           if (e2 instanceof LeaseLostError) {
             jlog.warn("lost the lease; another worker owns this job now", { err: errFields(e2) });
             return;
           }
-          throw e2;
-        });
+          // Framework error, not a handler failure: leave the lease for the
+          // sweeper; the job will re-run (handlers must be idempotent).
+          this.logFrameworkError(
+            "could not record completion; job stays leased until reclaim and will re-run",
+            e2,
+          );
+          return;
+        }
         this.qw.metrics.inc("qw_jobs_completed_total", [
           ["queue", job.queue],
           ["type", job.type],
