@@ -617,6 +617,12 @@ export class MemoryStorage implements StorageBackend {
     const sched = this.store.schedules.get(scheduleId);
     if (!sched) throw new ScheduleNotFoundError(scheduleId);
     if (sched.nextFireAt !== expectedPrevFireAt) return [];
+    // Check-and-set must complete synchronously (no await in between) so
+    // interleaved callers cannot all pass the guard.
+    sched.nextFireAt = nextFireAt;
+    if (fireTimes.length > 0) {
+      sched.lastFiredAt = fireTimes[fireTimes.length - 1]!;
+    }
     const t = this.now();
     const created: JobRecord[] = [];
     for (const fireAt of fireTimes) {
@@ -638,10 +644,6 @@ export class MemoryStorage implements StorageBackend {
       pushEvent(job, "schedule_fired", `schedule=${scheduleId}`, t);
       created.push(job);
     }
-    if (fireTimes.length > 0) {
-      sched.lastFiredAt = fireTimes[fireTimes.length - 1]!;
-    }
-    sched.nextFireAt = nextFireAt;
     return created;
   }
 
