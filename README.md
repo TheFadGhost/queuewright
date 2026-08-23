@@ -43,6 +43,13 @@ Run it: `npx tsx welcome.ts`. You will see the handler execute once.
 A job is defined once; both enqueueing and execution reference the same
 definition object, so a payload mismatch is caught at the call site (compile
 time via generics, runtime if you add `validate`) instead of inside a handler.
+`validate` receives the payload and returns `null` when it is valid, or an
+error string when it is not.
+
+Job states: `queued -> running -> succeeded`, with failures going to
+`retrying` (next automatic attempt), `dead` (retries exhausted, dead-letter
+queue), `failed` (fatal/non-retryable), plus `scheduled` (future run time) and
+`cancelled`. Every job keeps a full attempt history and event log.
 
 ## Delivery guarantee — read this
 
@@ -71,13 +78,22 @@ the key; unkeyed external side effects remain your responsibility.
 ```
 qw worker                 # worker + dashboard on http://localhost:7788
 qw-worker --no-dashboard  # worker only
-qw stats                  # depths, states, top types
+qw stats                  # depths, states, top types, latency percentiles
 qw list --state dead      # dead letters
 qw retry <job-id>         # requeue one
 qw retry --all-dead       # bulk requeue
 qw enqueue mail.welcome --payload '{"userId":"u_1"}'
 qw --help                 # full command reference
 ```
+
+`qw enqueue` talks to the shared store, so it works from any machine or shell
+without loading your handler code; the worker that executes the job must have
+the type registered. When run from source (this repository), use
+`npx tsx src/cli.ts ...`; the `qw` bin exists in the published npm package.
+
+Starting a worker also starts its scheduler: cron schedules are evaluated by
+any running worker against the shared store (fires are guarded by a
+compare-and-set so multiple workers never double-fire a slot).
 
 The dashboard shows queue depths over time, throughput, latency percentiles
 (p50/p95/p99), failure rates, per-type breakdowns, a searchable job list, a
@@ -106,6 +122,17 @@ defineJob("billing.charge", {
 - linear: `base * attempt`, capped
 - fixed: `base`
 - Throw `FatalJobError` to skip remaining retries and land in `failed`.
+
+Per-attempt timeouts race the handler and abort its `AbortSignal`. For
+CPU-bound handlers that ignore signals, opt into thread isolation so the
+timeout genuinely terminates the handler:
+
+```ts
+defineJob("cpu.hash", {
+  timeoutMs: 5_000,
+  execution: { thread: { module: "./workers/hash.ts", export: "handler" } },
+}, handler);
+```
 
 ## Scheduling
 
@@ -177,13 +204,19 @@ sensitive data; debug-level payloads are redacted unless
 ## Architecture note: claim / heartbeat / complete
 
 Workers atomically move due `queued` jobs to `running` with a lease
-(`visibilityTimeout`). While running they heartbeat every timeout/3. Success
-completes the job; failure schedules a retry or moves it to `dead` (exhausted)
-or `failed` (fatal). Any live worker's sweeper returns expired leases to the
-queue — that is the moment an at-least-once double-execution becomes possible.
-Graceful shutdown finishes in-flight work within a deadline and requeues the
-rest with attempts preserved. Per-job timeouts abort the handler's signal; the
-job slot frees immediately either way.
+(`visibilityTimeout`). While running they heartbeat every timeout/3 (lease
+extensions are clamped so a clock-skewed process cannot extend a lease
+indefinitely). Success completes the job; failure schedules a retry or moves
+it to `dead` (exhausted) or `failed` (fatal). Any live worker's sweeper
+returns expired leases to the queue - that is the moment an at-least-once
+double-execution becomes possible. Graceful shutdown stops claiming, waits
+for in-flight work within the deadline, and requeues the rest with attempts
+preserved. Per-job timeouts abort the handler's signal; with thread isolation
+the handler is terminated outright.
+
+Retention: terminal jobs, completion samples and stale idempotency locks are
+purged by the worker's retention sweep (`retentionMs`, default 7 days), so run
+at least one worker wherever your storage lives.
 
 ## Development
 
