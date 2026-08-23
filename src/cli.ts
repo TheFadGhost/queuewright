@@ -554,6 +554,9 @@ async function cmdEnqueue(args: ParsedArgs, globals: Globals): Promise<number> {
     if (unregistered && known.length > 0) {
       throw new UnregisteredJobTypeError(type, known);
     }
+    if (unregistered) {
+      opts.allowUnregistered = true;
+    }
     const rec = await qw.rawEnqueue(type, JSON.stringify(payload), opts);
     if (!globals.json && unregistered) {
       printLines([

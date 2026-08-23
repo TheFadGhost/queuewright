@@ -45,7 +45,7 @@ interface Store {
   seq: number;
   jobs: Map<string, JobRecord>;
   dedupe: Map<string, string>;
-  idempotency: Map<string, { status: "pending" | "done"; result: string | null }>;
+  idempotency: Map<string, { status: "pending" | "done"; result: string | null; createdAt: number }>;
   schedules: Map<string, ScheduleRecord>;
   pausedQueues: Set<string>;
   globalPaused: boolean;
@@ -462,10 +462,11 @@ export class MemoryStorage implements StorageBackend {
       }
     }
     this.store.completions = this.store.completions.filter((c) => c.finishedAt >= olderThanMs);
-    for (const key of [...this.store.idempotency.keys()]) {
-      if (this.store.idempotency.get(key)?.status === "pending") {
-        this.store.idempotency.delete(key);
-      }
+    const lockCutoff = this.now() - 3_600_000;
+    for (const [key, entry] of [...this.store.idempotency.entries()]) {
+      const staleLock = entry.status === "pending" && entry.createdAt < lockCutoff;
+      const agedDone = entry.status === "done" && entry.createdAt < olderThanMs;
+      if (staleLock || agedDone) this.store.idempotency.delete(key);
     }
     for (const key of [...this.store.dedupe.keys()]) {
       const ownerId = this.store.dedupe.get(key)!;
@@ -546,7 +547,7 @@ export class MemoryStorage implements StorageBackend {
     const existing = this.store.idempotency.get(key);
     if (existing?.status === "done") return { status: "done", result: existing.result! };
     if (existing?.status === "pending") return { status: "busy" };
-    this.store.idempotency.set(key, { status: "pending", result: null });
+    this.store.idempotency.set(key, { status: "pending", result: null, createdAt: this.now() });
     return { status: "run" };
   }
 
@@ -554,7 +555,7 @@ export class MemoryStorage implements StorageBackend {
     this.assertOpen();
     const existing = this.store.idempotency.get(key);
     if (existing?.status === "done") return;
-    this.store.idempotency.set(key, { status: "done", result });
+    this.store.idempotency.set(key, { status: "done", result, createdAt: this.now() });
   }
 
   async releaseIdempotency(key: string): Promise<void> {

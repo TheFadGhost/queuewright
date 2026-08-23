@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { readFile } from "node:fs/promises";
-import { join, normalize, extname, relative, isAbsolute } from "node:path";
+import { join, extname, relative, isAbsolute } from "node:path";
 import type { Queuewright } from "./client.js";
 import { isJobState } from "./state-machine.js";
 import type { JobState } from "./types.js";
@@ -228,9 +228,9 @@ const states = (params.get("states") ?? "")
 
   private async serveStatic(res: ServerResponse, rawPath: string): Promise<void> {
     const rel = rawPath === "/" ? "/index.html" : rawPath;
-    const safe = normalize(rel).replace(/^(\.\.[/\\])+/, "");
-    const file = join(this.assetsDir, safe);
-    if (!file.startsWith(this.assetsDir)) {
+    const file = join(this.assetsDir, rel);
+    const check = relative(this.assetsDir, file);
+    if (check.startsWith("..") || isAbsolute(check)) {
       res.writeHead(403).end();
       return;
     }

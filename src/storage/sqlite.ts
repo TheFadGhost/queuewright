@@ -82,7 +82,8 @@ CREATE INDEX IF NOT EXISTS qw_completions_time ON qw_completions (finished_at);
 CREATE TABLE IF NOT EXISTS qw_idempotency (
   key TEXT PRIMARY KEY,
   status TEXT NOT NULL,
-  result TEXT
+  result TEXT,
+  created_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS qw_schedules (
   id TEXT PRIMARY KEY,
@@ -183,7 +184,14 @@ export class SqliteStorage implements StorageBackend {
     this.db.exec("PRAGMA synchronous=NORMAL");
     this.db.exec("PRAGMA busy_timeout=5000");
     this.db.exec("PRAGMA foreign_keys=ON");
-    this.db.exec(SCHEMA);
+this.db.exec(SCHEMA);
+    const idemCols = this.db.prepare(`PRAGMA table_info(qw_idempotency)`).all() as Array<{ name: string }>;
+    if (!idemCols.some((c) => c.name === "created_at")) {
+      this.db.exec(`ALTER TABLE qw_idempotency ADD COLUMN created_at INTEGER`);
+    }
+    this.db
+      .prepare(`UPDATE qw_idempotency SET created_at=? WHERE created_at IS NULL`)
+      .run(this.now());
   }
 
 async close(): Promise<void> {
@@ -600,7 +608,12 @@ async close(): Promise<void> {
         .run(olderThanMs);
       const c = this.db.prepare(`SELECT changes() AS c`).get() as { c: number };
       this.db.prepare(`DELETE FROM qw_completions WHERE finished_at<?`).run(olderThanMs);
-      this.db.prepare(`DELETE FROM qw_idempotency WHERE status='pending'`).run();
+      // Pending idempotency locks are only stale after an hour; a lock held by
+      // a long-running execution must keep excluding concurrent runs.
+      const lockCutoff = this.now() - 3_600_000;
+      this.db
+        .prepare(`DELETE FROM qw_idempotency WHERE (status='pending' AND created_at<?) OR (status='done' AND created_at<?)`)
+        .run(lockCutoff, olderThanMs);
       return c.c;
     });
   }
@@ -681,7 +694,7 @@ async close(): Promise<void> {
       if (row?.status === "done") return { status: "done", result: row.result! } as const;
       if (row?.status === "pending") return { status: "busy" } as const;
       try {
-        this.db.prepare(`INSERT INTO qw_idempotency (key, status, result) VALUES (?,'pending',NULL)`).run(key);
+        this.db.prepare(`INSERT INTO qw_idempotency (key, status, result, created_at) VALUES (?,'pending',NULL,?)`).run(key, this.now());
         return { status: "run" } as const;
       } catch {
         return { status: "busy" } as const;
@@ -695,9 +708,9 @@ async close(): Promise<void> {
       const row = this.db.prepare(`SELECT status FROM qw_idempotency WHERE key=?`).get(key) as { status: string } | undefined;
       if (row?.status === "done") return;
       this.db
-        .prepare(`INSERT INTO qw_idempotency (key, status, result) VALUES (?,'done',?) 
-                  ON CONFLICT(key) DO UPDATE SET status='done', result=excluded.result`)
-        .run(key, result);
+        .prepare(`INSERT INTO qw_idempotency (key, status, result, created_at) VALUES (?,'done',?,?)
+                  ON CONFLICT(key) DO UPDATE SET status='done', result=excluded.result, created_at=excluded.created_at`)
+        .run(key, result, this.now());
     });
   }
 

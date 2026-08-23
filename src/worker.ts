@@ -211,8 +211,9 @@ const log = this.qw.logger.child({ module: "worker" });
           ["type", job.type],
           ["result", "succeeded"],
         ]);
-        this.qw.metrics.observeDuration(job.queue, job.type, Date.now() - startedAt);
-        jlog.info("job completed (thread-isolated)", { attempt: job.attempts, durationMs: Date.now() - startedAt });
+        const elapsedT = Math.max(0, this.qw.clock() - startedAt);
+        this.qw.metrics.observeDuration(job.queue, job.type, elapsedT);
+        jlog.info(`job completed (thread-isolated)`, { attempt: job.attempts, durationMs: elapsedT });
         return;
       }
 
@@ -246,6 +247,7 @@ const log = this.qw.logger.child({ module: "worker" });
         .catch(async (e) => ({ ok: false as const, e }));
       if (outcome.ok) {
         resultJson = outcome.r === undefined ? null : safeJson(outcome.r);
+        let completionFailed: unknown = null;
         try {
           await this.storage.completeJob(job.id, this.workerId, resultJson);
         } catch (e2) {
@@ -257,14 +259,21 @@ const log = this.qw.logger.child({ module: "worker" });
           }
           // Framework error, not a handler failure: leave the lease in place
           // so the sweeper reclaims and the job re-runs (at-least-once).
-          throw e2;
+          completionFailed = e2;
+        }
+        if (completionFailed !== null) {
+          this.logFrameworkError(
+            "could not record completion; job stays leased until reclaim and will re-run (handlers must be idempotent)",
+            completionFailed,
+          );
+          return;
         }
         this.qw.metrics.inc("qw_jobs_completed_total", [
           ["queue", job.queue],
           ["type", job.type],
           ["result", "succeeded"],
         ]);
-        const elapsed = this.qw.clock() - startedAt;
+        const elapsed = Math.max(0, this.qw.clock() - startedAt);
         this.qw.metrics.observeDuration(job.queue, job.type, elapsed);
         jlog.info("job completed", { attempt: job.attempts, durationMs: elapsed });
         await this.chainSuccess(def.type, outcome.r, payload);

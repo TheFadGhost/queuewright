@@ -280,7 +280,8 @@ function renderSummary(data) {
     for (let i = pts.length - 1; i >= 0; i--) {
       if (pts[i] && pts[i].durationsP95 != null) {
         p95 = pts[i].durationsP95;
-        p95Note = "last completed minute";
+        const bucketSec = Math.round(state.windowMs / BUCKETS / 1000);
+        p95Note = "last completed bucket (" + (bucketSec >= 60 ? bucketSec / 60 + " min" : bucketSec + " s") + ")";
         break;
       }
     }
@@ -628,7 +629,8 @@ function jobRow(job) {
   const tdC = ce("td", "num mono");
   if (job.createdAt != null) {
     tdC.appendChild(document.createTextNode(fmtDT(job.createdAt) + " UTC"));
-    tdC.title = fmtAbs(job.createdAt) + " UTC (" + rel(job.createdAt) + ")";
+    const relSpan = ce("span", "ts-rel", rel(job.createdAt));
+    tdC.appendChild(relSpan);
   } else {
     tdC.textContent = "-";
   }

@@ -138,7 +138,7 @@ describe("graceful shutdown under load loses nothing", () => {
         payload: "{}",
         payloadVersion: 1,
         priority: 0,
-        runAt: Date.now(),
+        runAt: clock.now(),
         maxAttempts: 2,
         timeoutMs: 5000,
         retry: { strategy: "fixed", baseDelayMs: 5, maxDelayMs: 5, jitter: "none" },
@@ -183,7 +183,10 @@ describe("chaos harness: randomized storage faults", () => {
       constructor(private base: StorageBackend) {}
       private async flaky<T>(op: string, fn: () => Promise<T>): Promise<T> {
         this.attempts++;
-        if (op !== "enqueue" && op !== "enqueueBatch" && Math.random() < 0.12 && injectedFailures < 12) {
+        // Deterministic cadence keeps the stated injected-failure count stable
+        // run to run while still hitting varied operations.
+        const eligible = op !== "enqueue" && op !== "enqueueBatch";
+        if (eligible && this.attempts % 7 === 0 && injectedFailures < 12) {
           injectedFailures++;
           throw new StorageUnavailableError(
             new Error(`injected fault #${injectedFailures} on ${op}`),
